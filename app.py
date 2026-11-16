@@ -3869,6 +3869,417 @@ def prepare_minimax_h3_image_assembled_dir(
     return assembled_dir
 
 
+def _bytes_to_gb_label(num_bytes: int) -> str:
+    """Format a byte count as GiB (1024^3) for logs. Not a performance claim."""
+    return f"{(int(num_bytes) / (1024 ** 3)):.2f} GiB"
+
+
+def _sum_unique_file_footprints(paths: List[str]) -> Dict[str, int]:
+    """
+    对给定路径列表按 (st_dev, st_ino) 去重后累计逻辑大小与已分配磁盘。
+    - 只统计普通文件；若路径是指向普通文件的软链，则跟随一次并按目标 inode 计；
+    - 不递归目录，不跟随目录软链；
+    - 稀疏文件的 allocated_bytes（st_blocks*512）可能远小于 logical_bytes（st_size）。
+    返回的 logical_bytes 适用于参数体积/内存常驻估计，allocated_bytes 适用于已占磁盘。
+    """
+    import stat as _stat
+
+    seen = set()
+    logical = 0
+    allocated = 0
+    counted = 0
+    skipped = 0
+    for raw in paths or []:
+        if not raw:
+            skipped += 1
+            continue
+        try:
+            st = os.lstat(raw)
+            if _stat.S_ISLNK(st.st_mode):
+                st = os.stat(raw)
+            if not _stat.S_ISREG(st.st_mode):
+                skipped += 1
+                continue
+            key = (st.st_dev, st.st_ino)
+            if key in seen:
+                continue
+            seen.add(key)
+            logical += int(st.st_size)
+            allocated += int(st.st_blocks) * 512
+            counted += 1
+        except OSError:
+            skipped += 1
+    return {
+        "logical_bytes": logical,
+        "allocated_bytes": allocated,
+        "file_count": counted,
+        "skipped": skipped,
+    }
+
+
+def _list_group_cache_safetensors(cache_dir: str) -> Dict[str, Any]:
+    """
+    只枚举 cache_dir 下一层名为 group_*.safetensors 的文件（Diffusers group offload 产物）。
+    若 cache_dir 本身是软链则拒绝扫描，避免误入官方权重树。不递归、不跟随目录软链。
+    """
+    result: Dict[str, Any] = {
+        "dir": cache_dir,
+        "paths": [],
+        "logical_bytes": 0,
+        "allocated_bytes": 0,
+        "file_count": 0,
+        "skipped": 0,
+        "is_symlink": False,
+        "exists": False,
+        "scan_skipped_reason": "",
+    }
+    if not cache_dir:
+        result["scan_skipped_reason"] = "empty_path"
+        return result
+    if os.path.islink(cache_dir):
+        result["is_symlink"] = True
+        result["exists"] = True
+        result["scan_skipped_reason"] = "dir_is_symlink"
+        return result
+    if not os.path.isdir(cache_dir):
+        result["scan_skipped_reason"] = "not_a_directory"
+        return result
+    result["exists"] = True
+    paths: List[str] = []
+    try:
+        with os.scandir(cache_dir) as it:
+            for ent in it:
+                try:
+                    if not ent.name.startswith("group_") or not ent.name.endswith(".safetensors"):
+                        continue
+                    if ent.is_symlink():
+                        try:
+                            if not os.path.isfile(ent.path):
+                                continue
+                        except OSError:
+                            continue
+                    elif not ent.is_file(follow_symlinks=False):
+                        continue
+                    paths.append(ent.path)
+                except OSError:
+                    continue
+    except OSError:
+        result["scan_skipped_reason"] = "scandir_failed"
+        return result
+    footprints = _sum_unique_file_footprints(paths)
+    result.update(footprints)
+    result["paths"] = paths
+    return result
+
+
+# 仅当本地分片无法测量时使用的回退天花板（GiB，1024^3）。
+# 来源：此前在官方 MiniMax-H3-Image 27 个 BF16 分片上按逻辑大小测得的约 62.133 / 61.737 / 2.176 GiB，向上取到 0.1 GiB。
+# 这是参数体积估计，不是加载或推理峰值，也不是对本次机器的承诺。
+_H3_IMAGE_FALLBACK_TE_WEIGHT_BYTES = int(62.2 * (1024 ** 3))
+_H3_IMAGE_FALLBACK_DIT_WEIGHT_BYTES = int(61.8 * (1024 ** 3))
+_H3_IMAGE_FALLBACK_VAE_WEIGHT_BYTES = int(2.2 * (1024 ** 3))
+# 进程/VAE/单 group 余量，不是 16MP 激活峰值，也未经 A100 40GB 实测。
+_H3_IMAGE_RAM_OVERHEAD_RESERVE_BYTES = 8 * (1024 ** 3)
+# group 序列化时的写盘余量（元数据/临时文件），不是推理峰值。
+_H3_IMAGE_DISK_WRITE_RESERVE_BYTES = 4 * (1024 ** 3)
+_H3_IMAGE_HIGH_VRAM_GB = 65.0
+_H3_IMAGE_HIGH_RAM_GB = 132.0
+_H3_IMAGE_OFFLOAD_POLICY_ID = "encoder_disk_dit_cpu_v1"
+
+
+def _h3_image_offload_cache_root(target_id: str, cwd: Optional[str] = None) -> str:
+    return os.path.join(cwd or os.getcwd(), "models", "_offload_cache", target_id)
+
+
+def _measure_h3_image_catalog_weight_bytes(target_id: str, prefix: str) -> Dict[str, Any]:
+    """
+    按 MODEL_CATALOG 中的精确分片文件名查找已有权重，按唯一 inode 累计大小。
+    不递归扫描 Hugging Face 缓存，不把 _offload_cache 或非 catalog 文件算进权重。
+    """
+    spec = MODEL_CATALOG.get(target_id) or {}
+    files = spec.get("files") or []
+    paths: List[str] = []
+    expected = 0
+    for fname, _desc in files:
+        if not str(fname).startswith(prefix) or not str(fname).endswith(".safetensors"):
+            continue
+        expected += 1
+        found = _find_existing_model_file(target_id, fname)
+        if found:
+            paths.append(found)
+    footprints = _sum_unique_file_footprints(paths)
+    footprints["expected_shards"] = expected
+    footprints["measured"] = expected > 0 and footprints["file_count"] == expected
+    footprints["prefix"] = prefix
+    return footprints
+
+
+def _inventory_h3_image_offload_cache(offload_root: str) -> Dict[str, Any]:
+    te = _list_group_cache_safetensors(os.path.join(offload_root, "text_encoder") if offload_root else "")
+    dit = _list_group_cache_safetensors(os.path.join(offload_root, "transformer") if offload_root else "")
+    root_is_symlink = bool(offload_root and os.path.islink(offload_root))
+    return {
+        "offload_root": offload_root,
+        "root_is_symlink": root_is_symlink,
+        "text_encoder": te,
+        "transformer": dit,
+    }
+
+
+def _disk_free_bytes_for_path(path: str) -> int:
+    """对将要写入的路径做 shutil.disk_usage（该路径所在文件系统的剩余空间），不扫描目录树。"""
+    probe = path or os.getcwd()
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    if not probe or not os.path.exists(probe):
+        probe = os.getcwd()
+    return int(shutil.disk_usage(probe).free)
+
+
+def _format_h3_image_manual_cache_cleanup(
+    offload_root: str,
+    official_weights_hint: str = "",
+    inventory: Optional[Dict[str, Any]] = None,
+) -> str:
+    inv = inventory or {}
+    dit = inv.get("transformer") or {}
+    te = inv.get("text_encoder") or {}
+    dit_alloc = int(dit.get("allocated_bytes") or 0)
+    te_alloc = int(te.get("allocated_bytes") or 0)
+    root_link = bool(inv.get("root_is_symlink") or te.get("is_symlink") or dit.get("is_symlink"))
+    lines = [
+        "不会自动删除任何文件。请勿删除官方权重目录"
+        + (f"（例如 {official_weights_hint}）" if official_weights_hint else "（例如 models/MiniMaxAI/MiniMax-H3-Image 下的官方分片）")
+        + "。",
+        "若需要腾出旧的 group offload 缓存（仅 group_*.safetensors，不是官方分片），请先确认路径是普通目录而不是指向官方权重的软链：",
+        f"  ls -ld {offload_root}",
+        "确认无软链后再手动执行：",
+        f"  rm -rf {offload_root}",
+    ]
+    if root_link:
+        lines.append("警告：检测到 offload 缓存路径本身是软链，禁止对该软链执行 rm -rf，以免误删指向的官方权重。")
+    if te_alloc or dit_alloc:
+        lines.append(
+            "当前扫描到的 group 缓存已分配空间（按 st_blocks，可能与逻辑大小不同）："
+            f" text_encoder 约 {_bytes_to_gb_label(te_alloc)}，transformer 约 {_bytes_to_gb_label(dit_alloc)}。"
+        )
+    lines.append("新的混合策略只需要 text_encoder 的 group 缓存；旧的 transformer 缓存不会被复用。")
+    lines.append("因 Diffusers 按 group 哈希命名文件，不能假定已有 text_encoder 缓存一定可跳过重写。空间紧张时应先按上面步骤清掉整个该模型 offload 缓存再加载。")
+    return "\n".join(lines)
+
+
+def _plan_minimax_h3_image_offload(
+    *,
+    total_vram_gb: float,
+    avail_ram_gb: float,
+    disk_free_bytes: Optional[int] = None,
+    te_weight_logical_bytes: Optional[int] = None,
+    dit_weight_logical_bytes: Optional[int] = None,
+    te_weight_measured: bool = False,
+    dit_weight_measured: bool = False,
+    existing_te_cache_allocated_bytes: int = 0,
+    existing_dit_cache_allocated_bytes: int = 0,
+    offload_root: str = "",
+    official_weights_hint: str = "",
+    cache_inventory: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    规划 MiniMax-H3-Image 在当前资源下的卸载策略。
+    资源数字均标明来源；不承诺实测加载/推理峰值。空间不足时抛出 RuntimeError，从不删除文件。
+    """
+    te_bytes = int(te_weight_logical_bytes) if te_weight_logical_bytes else _H3_IMAGE_FALLBACK_TE_WEIGHT_BYTES
+    dit_bytes = int(dit_weight_logical_bytes) if dit_weight_logical_bytes else _H3_IMAGE_FALLBACK_DIT_WEIGHT_BYTES
+    te_src = "measured_shard_logical_size" if (te_weight_measured and te_weight_logical_bytes) else "fallback_ceiling_official_bf16_shards"
+    dit_src = "measured_shard_logical_size" if (dit_weight_measured and dit_weight_logical_bytes) else "fallback_ceiling_official_bf16_shards"
+
+    estimates = {
+        "te_weight_logical_bytes": te_bytes,
+        "dit_weight_logical_bytes": dit_bytes,
+        "te_weight_source": te_src,
+        "dit_weight_source": dit_src,
+        "ram_overhead_reserve_bytes": _H3_IMAGE_RAM_OVERHEAD_RESERVE_BYTES,
+        "disk_write_reserve_bytes": _H3_IMAGE_DISK_WRITE_RESERVE_BYTES,
+        "peak_disclaimer": (
+            "以上为分片逻辑大小与固定余量，不是在本机测得的加载或推理峰值，"
+            "也不覆盖 16MP/参考图激活内存。"
+        ),
+    }
+
+    if float(total_vram_gb) >= _H3_IMAGE_HIGH_VRAM_GB and float(avail_ram_gb) >= _H3_IMAGE_HIGH_RAM_GB:
+        return {
+            "mode": "components_manager",
+            "te_offload_to_disk": False,
+            "dit_offload_to_disk": False,
+            "vae_offload_to_disk": False,
+            "te_use_stream": False,
+            "dit_use_stream": False,
+            "vae_use_stream": False,
+            "low_cpu_mem_usage": True,
+            "estimates": estimates,
+            "warnings": [],
+            "label_suffix": "ComponentsManager 内存热备",
+        }
+
+    if float(avail_ram_gb) >= _H3_IMAGE_HIGH_RAM_GB:
+        # 显存不足 65GB、但内存足以同时热备两个大件：保持原有 CPU group offload + use_stream。
+        return {
+            "mode": "cpu_group_offload",
+            "te_offload_to_disk": False,
+            "dit_offload_to_disk": False,
+            "vae_offload_to_disk": False,
+            "te_use_stream": True,
+            "dit_use_stream": True,
+            "vae_use_stream": False,
+            "low_cpu_mem_usage": True,
+            "estimates": estimates,
+            "warnings": [],
+            "label_suffix": "分层流式卸载",
+        }
+
+    # 低内存路径：只把 encoder 落到 group 磁盘缓存，DiT 常驻 CPU 内存。
+    # use_stream 会预取下一 group 并可能 pin 内存；官方说明会略增内存需求。
+    # 在约 80GiB 可用内存、DiT 约 62GiB 常驻的预算下关闭 use_stream，优先降低峰值，而非复用高内存路径的流式设置。
+    # low_cpu_mem_usage=True：apply_group_offloading 在写出 encoder group 后释放该组 CPU 副本，避免与随后加载的 DiT 叠满两份 62GiB。
+    warnings: List[str] = []
+    inv = cache_inventory or {}
+    if int(existing_dit_cache_allocated_bytes) > 0:
+        warnings.append(
+            "发现旧的 transformer group 缓存约 "
+            f"{_bytes_to_gb_label(int(existing_dit_cache_allocated_bytes))}，混合策略不会使用它。"
+        )
+    if int(existing_te_cache_allocated_bytes) > 0:
+        warnings.append(
+            "发现已有 text_encoder group 缓存约 "
+            f"{_bytes_to_gb_label(int(existing_te_cache_allocated_bytes))}。"
+            "仅当 group 哈希完全一致时 Diffusers 才会跳过重写；本检查不把该缓存算作已腾出的磁盘。"
+        )
+    if inv.get("root_is_symlink") or (inv.get("text_encoder") or {}).get("is_symlink") or (inv.get("transformer") or {}).get("is_symlink"):
+        warnings.append("offload 缓存路径或其子目录是软链，已跳过扫描且不会自动删除。")
+
+    avail_ram_bytes = int(float(avail_ram_gb) * (1024 ** 3))
+    required_ram_bytes = dit_bytes + _H3_IMAGE_RAM_OVERHEAD_RESERVE_BYTES
+    estimates["required_avail_ram_bytes"] = required_ram_bytes
+    estimates["avail_ram_bytes"] = avail_ram_bytes
+
+    if avail_ram_bytes < required_ram_bytes:
+        cleanup = _format_h3_image_manual_cache_cleanup(offload_root, official_weights_hint, inv)
+        raise RuntimeError(
+            "当前可用内存不足以按「encoder 磁盘 + DiT CPU 内存」策略装载 MiniMax-H3-Image。\n"
+            f"可用内存约 {_bytes_to_gb_label(avail_ram_bytes)}，"
+            f"估计下限为 DiT 分片 { _bytes_to_gb_label(dit_bytes) }（来源：{dit_src}）"
+            f" + 固定开销余量 {_bytes_to_gb_label(_H3_IMAGE_RAM_OVERHEAD_RESERVE_BYTES)} "
+            f"= {_bytes_to_gb_label(required_ram_bytes)}。\n"
+            "该下限不是实测推理峰值；若其他进程占用了大量内存，可先释放后再试。\n"
+            + cleanup
+        )
+
+    required_disk_bytes = te_bytes + _H3_IMAGE_DISK_WRITE_RESERVE_BYTES
+    estimates["required_disk_bytes"] = required_disk_bytes
+    estimates["disk_free_bytes"] = int(disk_free_bytes) if disk_free_bytes is not None else None
+    # 不把已有 encoder 缓存从需求里扣除：哈希不一致时会再写一份，旧文件仍占空间。
+    if disk_free_bytes is None or int(disk_free_bytes) < required_disk_bytes:
+        free_label = "未知" if disk_free_bytes is None else _bytes_to_gb_label(int(disk_free_bytes))
+        leftover = int(existing_te_cache_allocated_bytes) + int(existing_dit_cache_allocated_bytes)
+        leftover_note = (
+            f"扫描到的旧 group 缓存合计已分配约 {_bytes_to_gb_label(leftover)}，手动删除后可能腾出相应空间（以系统回收为准）。\n"
+            if leftover > 0
+            else ""
+        )
+        cleanup = _format_h3_image_manual_cache_cleanup(offload_root, official_weights_hint, inv)
+        raise RuntimeError(
+            "磁盘剩余空间不足以写入 text_encoder 的 group offload 缓存，已提前停止，以免再次写满磁盘。\n"
+            f"磁盘剩余 {free_label}，估计需要再写入 encoder 缓存 "
+            f"{_bytes_to_gb_label(te_bytes)}（来源：{te_src}）"
+            f" + 写盘余量 {_bytes_to_gb_label(_H3_IMAGE_DISK_WRITE_RESERVE_BYTES)} "
+            f"= {_bytes_to_gb_label(required_disk_bytes)}。\n"
+            "该估计不是推理峰值，也不保证 group 文件与分片大小完全相等。\n"
+            + leftover_note
+            + cleanup
+        )
+
+    return {
+        "mode": "hybrid_encoder_disk_dit_cpu",
+        "te_offload_to_disk": True,
+        "dit_offload_to_disk": False,
+        "vae_offload_to_disk": False,
+        "te_use_stream": False,
+        "dit_use_stream": False,
+        "vae_use_stream": False,
+        "low_cpu_mem_usage": True,
+        "estimates": estimates,
+        "warnings": warnings,
+        "label_suffix": "Encoder 磁盘分层 + DiT 内存分层",
+    }
+
+
+def _h3_image_group_offload_steps(plan: Dict[str, Any], offload_root: str) -> List[Dict[str, Any]]:
+    """按 text_encoder → transformer → vae 的顺序给出 apply_group_offloading 参数。"""
+    te_disk = os.path.join(offload_root, "text_encoder") if plan.get("te_offload_to_disk") else None
+    dit_disk = os.path.join(offload_root, "transformer") if plan.get("dit_offload_to_disk") else None
+    vae_disk = os.path.join(offload_root, "vae") if plan.get("vae_offload_to_disk") else None
+    return [
+        {
+            "component": "text_encoder",
+            "offload_to_disk_path": te_disk,
+            "use_stream": bool(plan.get("te_use_stream")),
+            "low_cpu_mem_usage": bool(plan.get("low_cpu_mem_usage", True)),
+            "enable_tiling": False,
+        },
+        {
+            "component": "transformer",
+            "offload_to_disk_path": dit_disk,
+            "use_stream": bool(plan.get("dit_use_stream")),
+            "low_cpu_mem_usage": bool(plan.get("low_cpu_mem_usage", True)),
+            "enable_tiling": False,
+        },
+        {
+            "component": "vae",
+            "offload_to_disk_path": vae_disk,
+            "use_stream": bool(plan.get("vae_use_stream")),
+            "low_cpu_mem_usage": False,
+            "enable_tiling": True,
+        },
+    ]
+
+
+def _log_h3_image_offload_plan(plan: Dict[str, Any], total_vram_gb: float, avail_ram_gb: float) -> None:
+    est = plan.get("estimates") or {}
+    print(
+        "⚡ [MiniMax-H3-Image] 卸载策略 "
+        f"{plan.get('mode')} | VRAM {float(total_vram_gb):.1f}GB / 可用 RAM {float(avail_ram_gb):.1f}GB | "
+        f"TE {_bytes_to_gb_label(int(est.get('te_weight_logical_bytes') or 0))} ({est.get('te_weight_source')}) / "
+        f"DiT {_bytes_to_gb_label(int(est.get('dit_weight_logical_bytes') or 0))} ({est.get('dit_weight_source')})"
+    )
+    print(f"⚡ [MiniMax-H3-Image] {est.get('peak_disclaimer', '')}")
+    for warning in plan.get("warnings") or []:
+        print(f"⚠️ [MiniMax-H3-Image] {warning}")
+
+
+def _write_h3_image_offload_policy_marker(offload_root: str, plan: Dict[str, Any]) -> None:
+    if not offload_root or not plan.get("te_offload_to_disk"):
+        return
+    if os.path.islink(offload_root):
+        return
+    os.makedirs(offload_root, exist_ok=True)
+    marker_path = os.path.join(offload_root, "easycolab_offload_policy.json")
+    try:
+        with open(marker_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "policy": _H3_IMAGE_OFFLOAD_POLICY_ID,
+                    "mode": plan.get("mode"),
+                    "note": "encoder disk group offload + DiT CPU RAM group offload; not a peak-memory measurement",
+                },
+                f,
+                indent=2,
+            )
+    except OSError as exc:
+        print(f"⚠️ [MiniMax-H3-Image] 未能写入 offload 策略标记: {exc}")
+
+
 def load_minimax_h3_image_pipeline(
     target_id: str,
     spec: Dict[str, Any],
@@ -3880,8 +4291,10 @@ def load_minimax_h3_image_pipeline(
     专用加载方法：装载 MiniMax-H3-Image (33B DiT + 32B VLM 编码器) 6 步原生 4K 模块化管线。
     - 大显存 + 大内存机型 (如 G4 96GB / H100 80GB / A100 High-RAM，VRAM>=65GB 且可用 RAM>=132GB)：
       采用官方 ComponentsManager(enable_auto_cpu_offload) 在 DDR5 系统内存与显存间整块极速轮换；
-    - 中等显存或标准内存机型 (如 A100 40GB / L4 24GB 或可用 RAM<132GB)：
-      按组件顺序加载并挂载 Diffusers Group Offloading (leaf_level + 磁盘/内存分层卸载) + 4K VAE Tiling，严防 OOM。
+    - 中等显存但可用 RAM>=132GB：按组件顺序加载并挂载 Diffusers Group Offloading（两件都在 CPU 内存，leaf_level + use_stream）+ 4K VAE Tiling；
+    - 可用 RAM<132GB（如 A100 40GB Standard）：encoder 磁盘 group offload，DiT 常驻 CPU 内存 group offload（关闭 use_stream），VAE 仍只在内存；
+      加载前按分片大小做磁盘/内存预检查，空间不足则提前失败并给出手动清理缓存说明，绝不自动删除官方权重。
+      资源数字为分片逻辑大小加固定余量，不是实测加载或 4K/参考图峰值。
     """
     if total_vram_gb < 22.0:
         raise RuntimeError(
@@ -3925,68 +4338,74 @@ def load_minimax_h3_image_pipeline(
         )
         return pipe, mode_label
 
-    # 回退分支：中等显存 (<65GB) 或标准主机内存 (<132GB) 分组件顺序装载 + Group Offloading
+    # 回退分支：中等显存 (<65GB) 或标准主机内存 (<132GB) 分组件顺序装载 + Group Offloading。
+    # 低内存时不再把 encoder 与 DiT 都序列化到磁盘（约两份 62GiB，会在 235GB 盘上写满），
+    # 改为 encoder 磁盘 group offload + DiT CPU 内存 group offload；空间不足则提前失败并提示手动清理缓存。
     from diffusers.hooks import apply_group_offloading
 
-    use_disk_offload = avail_ram_gb < 132.0
-    offload_root = os.path.join(os.getcwd(), "models", "_offload_cache", target_id)
-    if use_disk_offload:
-        os.makedirs(offload_root, exist_ok=True)
+    offload_root = _h3_image_offload_cache_root(target_id)
+    _, nvme_dir, _ = _get_model_dirs(target_id)
+    official_weights_hint = nvme_dir
+    te_weight = _measure_h3_image_catalog_weight_bytes(target_id, "text_encoder/")
+    dit_weight = _measure_h3_image_catalog_weight_bytes(target_id, "transformer_diffusers/")
+    cache_inventory = _inventory_h3_image_offload_cache(offload_root)
+    disk_free_bytes = _disk_free_bytes_for_path(offload_root)
+    plan = _plan_minimax_h3_image_offload(
+        total_vram_gb=total_vram_gb,
+        avail_ram_gb=avail_ram_gb,
+        disk_free_bytes=disk_free_bytes,
+        te_weight_logical_bytes=te_weight["logical_bytes"] or None,
+        dit_weight_logical_bytes=dit_weight["logical_bytes"] or None,
+        te_weight_measured=bool(te_weight["measured"]),
+        dit_weight_measured=bool(dit_weight["measured"]),
+        existing_te_cache_allocated_bytes=int((cache_inventory.get("text_encoder") or {}).get("allocated_bytes") or 0),
+        existing_dit_cache_allocated_bytes=int((cache_inventory.get("transformer") or {}).get("allocated_bytes") or 0),
+        offload_root=offload_root,
+        official_weights_hint=official_weights_hint,
+        cache_inventory=cache_inventory,
+    )
+    _log_h3_image_offload_plan(plan, total_vram_gb, avail_ram_gb)
+    _write_h3_image_offload_policy_marker(offload_root, plan)
 
     pipe = ModularPipeline.from_pretrained(assembled_dir)
     MODEL_DOWNLOAD_STATE["progress"] = 0.42
     MODEL_DOWNLOAD_STATE["message"] = "正在加载 MiniMax-H3-Image 调度器与多模态 Processor..."
     pipe.load_components(names=["scheduler", "tokenizer", "processor"])
 
-    MODEL_DOWNLOAD_STATE["progress"] = 0.54
-    MODEL_DOWNLOAD_STATE["message"] = "正在分层装载 32B 视觉文本编码器 (1/3)..."
-    pipe.load_components(names="text_encoder", dtype=torch.bfloat16)
-    te_disk = os.path.join(offload_root, "text_encoder") if use_disk_offload else None
-    if te_disk:
-        os.makedirs(te_disk, exist_ok=True)
-    apply_group_offloading(
-        pipe.text_encoder,
-        onload_device=torch.device("cuda"),
-        offload_device=torch.device("cpu"),
-        offload_type="leaf_level",
-        use_stream=not use_disk_offload,
-        low_cpu_mem_usage=True,
-        offload_to_disk_path=te_disk,
-    )
-    _trim_linux_cpu_heap()
-
-    MODEL_DOWNLOAD_STATE["progress"] = 0.74
-    MODEL_DOWNLOAD_STATE["message"] = "正在分层装载 33B 图像 DiT 主干 (2/3)..."
-    pipe.load_components(names="transformer", dtype=torch.bfloat16)
-    dit_disk = os.path.join(offload_root, "transformer") if use_disk_offload else None
-    if dit_disk:
-        os.makedirs(dit_disk, exist_ok=True)
-    apply_group_offloading(
-        pipe.transformer,
-        onload_device=torch.device("cuda"),
-        offload_device=torch.device("cpu"),
-        offload_type="leaf_level",
-        use_stream=not use_disk_offload,
-        low_cpu_mem_usage=True,
-        offload_to_disk_path=dit_disk,
-    )
-    _trim_linux_cpu_heap()
-
-    MODEL_DOWNLOAD_STATE["progress"] = 0.88
-    MODEL_DOWNLOAD_STATE["message"] = "正在装载 4K 16MP 图像 VAE 并开启分块解码保护 (3/3)..."
-    pipe.load_components(names="vae", dtype=torch.bfloat16)
-    if hasattr(pipe.vae, "enable_tiling"):
-        pipe.vae.enable_tiling()
-    apply_group_offloading(
-        pipe.vae,
-        onload_device=torch.device("cuda"),
-        offload_device=torch.device("cpu"),
-        offload_type="leaf_level",
-        use_stream=False,
-    )
-    _trim_linux_cpu_heap()
-    tag_suffix = "NVMe 分层卸载" if use_disk_offload else "分层流式卸载"
-    return pipe, f"{spec['name']} · BF16 · {tag_suffix}"
+    load_messages = {
+        "text_encoder": (0.54, "正在分层装载 32B 视觉文本编码器 (1/3)..."),
+        "transformer": (0.74, "正在分层装载 33B 图像 DiT 主干 (2/3)..."),
+        "vae": (0.88, "正在装载 4K 16MP 图像 VAE 并开启分块解码保护 (3/3)..."),
+    }
+    for step in _h3_image_group_offload_steps(plan, offload_root):
+        component = step["component"]
+        progress, message = load_messages[component]
+        MODEL_DOWNLOAD_STATE["progress"] = progress
+        MODEL_DOWNLOAD_STATE["message"] = message
+        pipe.load_components(names=component, dtype=torch.bfloat16)
+        module = getattr(pipe, component)
+        if step["enable_tiling"] and hasattr(module, "enable_tiling"):
+            module.enable_tiling()
+        disk_path = step["offload_to_disk_path"]
+        if disk_path:
+            if os.path.islink(disk_path):
+                raise RuntimeError(
+                    f"拒绝向软链目录写入 group offload 缓存: {disk_path}。"
+                    "请将该路径改为普通目录，或按提示手动处理，切勿对指向官方权重的软链执行删除。"
+                )
+            os.makedirs(disk_path, exist_ok=True)
+        apply_kw = {
+            "onload_device": torch.device("cuda"),
+            "offload_device": torch.device("cpu"),
+            "offload_type": "leaf_level",
+            "use_stream": step["use_stream"],
+        }
+        if component != "vae":
+            apply_kw["low_cpu_mem_usage"] = step["low_cpu_mem_usage"]
+        apply_kw["offload_to_disk_path"] = disk_path
+        apply_group_offloading(module, **apply_kw)
+        _trim_linux_cpu_heap()
+    return pipe, f"{spec['name']} · BF16 · {plan['label_suffix']}"
 
 
 def run_minimax_h3_image_inference(
