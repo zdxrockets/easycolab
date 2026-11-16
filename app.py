@@ -4264,9 +4264,17 @@ def _write_h3_image_offload_policy_marker(offload_root: str, plan: Dict[str, Any
     if os.path.islink(offload_root):
         return
     os.makedirs(offload_root, exist_ok=True)
-    marker_path = os.path.join(offload_root, "easycolab_offload_policy.json")
+    import uuid
+
+    directory_fd = None
+    temporary_name = ".easycolab-policy-" + uuid.uuid4().hex
+    marker_name = "easycolab_offload_policy.json"
     try:
-        with open(marker_path, "w", encoding="utf-8") as f:
+        directory_fd = os.open(offload_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        # Never open the old marker for writing: it may share an inode with weights.
+        fd = os.open(temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory_fd)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(
                 {
                     "policy": _H3_IMAGE_OFFLOAD_POLICY_ID,
@@ -4276,8 +4284,17 @@ def _write_h3_image_offload_policy_marker(offload_root: str, plan: Dict[str, Any
                 f,
                 indent=2,
             )
+        os.replace(temporary_name, marker_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
     except OSError as exc:
         print(f"⚠️ [MiniMax-H3-Image] 未能写入 offload 策略标记: {exc}")
+    finally:
+        if directory_fd is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            os.close(directory_fd)
+
 
 
 def load_minimax_h3_image_pipeline(

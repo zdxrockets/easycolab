@@ -317,6 +317,23 @@ class H3ImageOffloadPlanTest(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(target, "easycolab_offload_policy.json")))
             self.assertFalse(os.path.exists(os.path.join(link_root, "easycolab_offload_policy.json")))
 
+    def test_policy_marker_preserves_linked_weights(self):
+        for link_type in ("symlink", "hardlink"):
+            with self.subTest(link_type=link_type), tempfile.TemporaryDirectory() as tmp:
+                root = os.path.join(tmp, "cache")
+                os.mkdir(root)
+                weight = os.path.join(tmp, "weight.safetensors")
+                original = b"OFFICIAL WEIGHTS DO NOT OVERWRITE"
+                _write_file(weight, original)
+                inode = os.stat(weight).st_ino
+                marker = os.path.join(root, "easycolab_offload_policy.json")
+                (os.symlink if link_type == "symlink" else os.link)(weight, marker)
+                self.ns["_write_h3_image_offload_policy_marker"](
+                    root, {"te_offload_to_disk": True, "mode": "hybrid_encoder_disk_dit_cpu"})
+                with open(weight, "rb") as f:
+                    self.assertEqual(f.read(), original)
+                self.assertEqual(os.stat(weight).st_ino, inode)
+
     def test_fallback_constants_are_labeled_ceilings_not_peaks(self):
         self.assertEqual(self.ns["_H3_IMAGE_FALLBACK_TE_WEIGHT_BYTES"], TE_FALLBACK)
         self.assertEqual(self.ns["_H3_IMAGE_FALLBACK_DIT_WEIGHT_BYTES"], DIT_FALLBACK)
