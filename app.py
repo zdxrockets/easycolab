@@ -4009,7 +4009,12 @@ def _measure_h3_image_catalog_weight_bytes(target_id: str, prefix: str) -> Dict[
             paths.append(found)
     footprints = _sum_unique_file_footprints(paths)
     footprints["expected_shards"] = expected
-    footprints["measured"] = expected > 0 and footprints["file_count"] == expected
+    try:
+        nonempty = all(os.path.getsize(path) > 0 for path in paths)
+    except OSError:
+        nonempty = False
+    footprints["measured"] = (expected > 0 and footprints["file_count"] == expected
+                              and footprints["skipped"] == 0 and nonempty)
     footprints["prefix"] = prefix
     return footprints
 
@@ -4140,8 +4145,8 @@ def _plan_minimax_h3_image_offload(
     规划 MiniMax-H3-Image 在当前资源下的卸载策略。
     资源数字均标明来源；不承诺实测加载/推理峰值。空间不足时抛出 RuntimeError，从不删除文件。
     """
-    te_bytes = int(te_weight_logical_bytes) if te_weight_logical_bytes else _H3_IMAGE_FALLBACK_TE_WEIGHT_BYTES
-    dit_bytes = int(dit_weight_logical_bytes) if dit_weight_logical_bytes else _H3_IMAGE_FALLBACK_DIT_WEIGHT_BYTES
+    te_bytes = int(te_weight_logical_bytes) if te_weight_measured and te_weight_logical_bytes else _H3_IMAGE_FALLBACK_TE_WEIGHT_BYTES
+    dit_bytes = int(dit_weight_logical_bytes) if dit_weight_measured and dit_weight_logical_bytes else _H3_IMAGE_FALLBACK_DIT_WEIGHT_BYTES
     te_src = "measured_shard_logical_size" if (te_weight_measured and te_weight_logical_bytes) else "fallback_ceiling_official_bf16_shards"
     dit_src = "measured_shard_logical_size" if (dit_weight_measured and dit_weight_logical_bytes) else "fallback_ceiling_official_bf16_shards"
 

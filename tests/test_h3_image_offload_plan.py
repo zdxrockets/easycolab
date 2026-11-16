@@ -12,6 +12,7 @@ APP_PY_PATH = os.path.join(REPO_ROOT, "app.py")
 
 PLANNER_FUNCS = {
     "_h3_image_te_cache_is_compatible",
+    "_measure_h3_image_catalog_weight_bytes",
     "_bytes_to_gb_label",
     "_sum_unique_file_footprints",
     "_list_group_cache_safetensors",
@@ -478,6 +479,43 @@ class H3ImageOffloadPlanTest(unittest.TestCase):
             os.rename(weight, path)
             deps["diffusers"].__version__ = "0.44.0"
             self.assertFalse(check(module, root))
+
+    def test_incomplete_shards_use_full_disk_and_ram_ceilings(self):
+        for state in ("complete", "missing", "unreadable", "zero", "all_zero"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as root:
+                ns = _extract_app_helpers()
+                names = [f"{prefix}/part-{i}.safetensors"
+                         for prefix in ("text_encoder", "transformer_diffusers") for i in (1, 2)]
+                ns["MODEL_CATALOG"] = {"model": {"files": [(n, "") for n in names]}}
+                for name in names:
+                    if state == "missing" and "part-2" in name:
+                        continue
+                    _write_file(os.path.join(root, name), b"" if state == "all_zero" or (
+                        state == "zero" and "part-2" in name) else b"weight")
+                ns["_find_existing_model_file"] = lambda target, name: (
+                    os.path.join(root, name) if os.path.isfile(os.path.join(root, name)) else None)
+                original_lstat = os.lstat
+                def lstat(path, *args, **kwargs):
+                    if state == "unreadable" and "part-2" in str(path):
+                        raise PermissionError("injected unreadable shard")
+                    return original_lstat(path, *args, **kwargs)
+                with mock.patch.object(os, "lstat", side_effect=lstat):
+                    te = ns["_measure_h3_image_catalog_weight_bytes"]("model", "text_encoder/")
+                    dit = ns["_measure_h3_image_catalog_weight_bytes"]("model", "transformer_diffusers/")
+                self.assertEqual(te["measured"], state == "complete")
+                kw = dict(total_vram_gb=40, avail_ram_gb=80, disk_free_bytes=80 * 1024**3,
+                          te_weight_logical_bytes=te["logical_bytes"],
+                          dit_weight_logical_bytes=dit["logical_bytes"],
+                          te_weight_measured=te["measured"], dit_weight_measured=dit["measured"])
+                plan = ns["_plan_minimax_h3_image_offload"](**kw)
+                e = plan["estimates"]
+                self.assertEqual(e["required_disk_bytes"], (12 if state == "complete" else TE_FALLBACK) + DISK_RESERVE)
+                self.assertEqual(e["required_avail_ram_bytes"], (12 if state == "complete" else DIT_FALLBACK) + RAM_RESERVE)
+                if state != "complete":
+                    with self.assertRaises(RuntimeError):
+                        ns["_plan_minimax_h3_image_offload"](**dict(kw, disk_free_bytes=63 * 1024**3))
+                    with self.assertRaises(RuntimeError):
+                        ns["_plan_minimax_h3_image_offload"](**dict(kw, avail_ram_gb=66))
 
     def test_fallback_constants_are_labeled_ceilings_not_peaks(self):
         self.assertEqual(self.ns["_H3_IMAGE_FALLBACK_TE_WEIGHT_BYTES"], TE_FALLBACK)
