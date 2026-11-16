@@ -11,6 +11,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP_PY_PATH = os.path.join(REPO_ROOT, "app.py")
 
 PLANNER_FUNCS = {
+    "_h3_image_te_cache_is_compatible",
     "_bytes_to_gb_label",
     "_sum_unique_file_footprints",
     "_list_group_cache_safetensors",
@@ -333,6 +334,150 @@ class H3ImageOffloadPlanTest(unittest.TestCase):
                 with open(weight, "rb") as f:
                     self.assertEqual(f.read(), original)
                 self.assertEqual(os.stat(weight).st_ino, inode)
+
+    def test_loader_reuses_complete_cache_at_47gib_free(self):
+        import numpy  # Import before patch.dict so extension modules remain loaded.
+        import safetensors
+        import hashlib
+        import json
+        import struct
+        import sys
+        from types import SimpleNamespace
+        class Leaf:
+            def parameters(self):
+                return [SimpleNamespace(dtype="torch.bfloat16", shape=(2,))]
+            def buffers(self):
+                return []
+            def named_modules(self):
+                return [("", self)]
+        # Tensors must be identity-hashable, as real torch tensors are.
+        class Tensor:
+            dtype = "torch.bfloat16"
+            shape = (2,)
+        leaf = Leaf()
+        tensor = Tensor()
+        leaf.parameters = lambda: [tensor]
+        go = SimpleNamespace(
+            _GO_LC_SUPPORTED_PYTORCH_LAYERS=(Leaf,),
+            _gather_parameters_with_no_group_offloading_parent=lambda *args: [],
+            _gather_buffers_with_no_group_offloading_parent=lambda *args: [],
+            _find_parent_module_in_module_dict=lambda *args: "",
+            _compute_group_hash=lambda name: hashlib.sha256(name.encode()).hexdigest()[:16])
+        loaded, applied = [], []
+        pipe = SimpleNamespace(text_encoder=leaf, transformer=object(), vae=object(),
+                               load_components=lambda **kw: loaded.append(kw.get("names")))
+        pipeline = SimpleNamespace(from_pretrained=lambda *a, **kw: pipe)
+        with tempfile.TemporaryDirectory() as root:
+            te_dir = os.path.join(root, "text_encoder")
+            header = json.dumps({"tensor_0": {"dtype": "BF16", "shape": [2],
+                                             "data_offsets": [0, 4]}}).encode()
+            header += b" " * (-len(header) % 8)
+            path = os.path.join(te_dir, "group_" + go._compute_group_hash("") + ".safetensors")
+            _write_file(path, struct.pack("<Q", len(header)) + header + bytes(4))
+            with open(path, "rb") as f:
+                before = f.read()
+            ns = _extract_app_helpers()
+            ns.update({"Tuple": __import__("typing").Tuple,
+                       "torch": SimpleNamespace(bfloat16="bf16", device=lambda d: d),
+                       "MODEL_DOWNLOAD_STATE": {},
+                       "ensure_minimax_h3_image_dependencies": lambda: (object, pipeline),
+                       "_trim_linux_cpu_heap": lambda: None,
+                       "_get_system_ram_gb": lambda: (83, 80),
+                       "prepare_minimax_h3_image_assembled_dir": lambda **kw: root,
+                       "_h3_image_offload_cache_root": lambda target: root,
+                       "_get_model_dirs": lambda target: (None, root, None),
+                       "_measure_h3_image_catalog_weight_bytes": lambda *args: {
+                           "logical_bytes": 62 * 1024**3, "measured": True},
+                       "_disk_free_bytes_for_path": lambda path: 47 * 1024**3})
+            exec(_extract_function_source("load_minimax_h3_image_pipeline"), ns)
+            deps = {"diffusers": SimpleNamespace(__version__="0.43.0"),
+                    "diffusers.hooks": SimpleNamespace(group_offloading=go,
+                        apply_group_offloading=lambda module, **kw: applied.append(kw))}
+            with mock.patch.dict(sys.modules, deps):
+                ns["load_minimax_h3_image_pipeline"]("minimax_h3_image", {"name": "H3"}, 40, 40)
+            self.assertEqual(loaded, [["scheduler", "tokenizer", "processor"],
+                                      "text_encoder", "transformer", "vae"])
+            self.assertEqual(len(applied), 3)
+            self.assertIsNone(applied[1]["offload_to_disk_path"])
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), before)
+            # A candidate file is not proof. Recheck before any offload write.
+            _write_file(path, b"truncated cache")
+            loaded.clear()
+            applied.clear()
+            with mock.patch.dict(sys.modules, deps), self.assertRaises(RuntimeError):
+                ns["load_minimax_h3_image_pipeline"]("minimax_h3_image", {"name": "H3"}, 40, 40)
+            self.assertEqual(applied, [])
+            self.assertNotIn("transformer", loaded)
+
+    def test_compatible_cache_needs_only_write_reserve(self):
+        plan = self.ns["_plan_minimax_h3_image_offload"](
+            total_vram_gb=40, avail_ram_gb=80, disk_free_bytes=47 * 1024**3,
+            te_weight_logical_bytes=62 * 1024**3, te_weight_measured=True,
+            te_cache_compatible=True)
+        self.assertEqual(plan["estimates"]["required_disk_bytes"], DISK_RESERVE)
+        for compatible in (False,):
+            with self.assertRaises(RuntimeError):
+                self.ns["_plan_minimax_h3_image_offload"](
+                    total_vram_gb=40, avail_ram_gb=80, disk_free_bytes=47 * 1024**3,
+                    existing_te_cache_allocated_bytes=62 * 1024**3,
+                    te_cache_compatible=compatible)
+
+    def test_cache_matches_group_names_keys_shapes_and_dtype(self):
+        import numpy  # Import before patch.dict so extension modules remain loaded.
+        import safetensors
+        import hashlib
+        import json
+        import struct
+        import sys
+        from types import SimpleNamespace
+        class Tensor:
+            dtype = "torch.bfloat16"
+            shape = (2,)
+        class Leaf:
+            def __init__(self):
+                self.tensor = Tensor()
+            def parameters(self):
+                return [self.tensor]
+            def buffers(self):
+                return []
+        leaf = Leaf()
+        module = SimpleNamespace(named_modules=lambda: [("", object()), ("layer", leaf)])
+        go = SimpleNamespace(
+            _GO_LC_SUPPORTED_PYTORCH_LAYERS=(Leaf,),
+            _gather_parameters_with_no_group_offloading_parent=lambda m, names: [],
+            _gather_buffers_with_no_group_offloading_parent=lambda m, names: [],
+            _find_parent_module_in_module_dict=lambda name, modules: "",
+            _compute_group_hash=lambda name: hashlib.sha256(name.encode()).hexdigest()[:16])
+        deps = {"diffusers": SimpleNamespace(__version__="0.43.0"),
+                "diffusers.hooks": SimpleNamespace(group_offloading=go)}
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(sys.modules, deps):
+            check = self.ns["_h3_image_te_cache_is_compatible"]
+            path = os.path.join(root, "group_" + go._compute_group_hash("layer") + ".safetensors")
+            def write(key="tensor_0", shape=None, dtype="BF16"):
+                header = json.dumps({key: {"dtype": dtype, "shape": shape or [2],
+                                          "data_offsets": [0, 4]}}).encode()
+                header += b" " * (-len(header) % 8)
+                _write_file(path, struct.pack("<Q", len(header)) + header + bytes(4))
+            self.assertFalse(check(module, root))
+            write()
+            self.assertTrue(check(module, root))
+            for kwargs in ({"key": "weight"}, {"shape": [1, 2]}, {"dtype": "F16"}):
+                write(**kwargs)
+                self.assertFalse(check(module, root), kwargs)
+            write()
+            with open(path, "r+b") as f:
+                f.truncate(9)
+            self.assertFalse(check(module, root))
+            write()
+            weight = os.path.join(root, "official")
+            os.rename(path, weight)
+            os.symlink(weight, path)
+            self.assertFalse(check(module, root))
+            os.unlink(path)
+            os.rename(weight, path)
+            deps["diffusers"].__version__ = "0.44.0"
+            self.assertFalse(check(module, root))
 
     def test_fallback_constants_are_labeled_ceilings_not_peaks(self):
         self.assertEqual(self.ns["_H3_IMAGE_FALLBACK_TE_WEIGHT_BYTES"], TE_FALLBACK)

@@ -4071,6 +4071,54 @@ def _format_h3_image_manual_cache_cleanup(
     return "\n".join(lines)
 
 
+def _h3_image_te_cache_is_compatible(module: Any, cache_dir: str) -> bool:
+    """Match every leaf-level group against the loaded encoder before discounting writes.
+
+    This mirrors Diffusers 0.43's no-stream grouping, including non-leaf tensors.
+    Unknown versions and incomplete/unreadable caches keep the full disk budget.
+    Only safetensors metadata is read; encoder tensors are never copied here.
+    """
+    try:
+        import diffusers
+        from diffusers.hooks import group_offloading as go
+        from safetensors import safe_open
+
+        if diffusers.__version__ != "0.43.0" or os.path.islink(cache_dir) or not os.path.isdir(cache_dir):
+            return False
+        modules = dict(module.named_modules())
+        leaves = {name for name, child in modules.items()
+                  if isinstance(child, go._GO_LC_SUPPORTED_PYTORCH_LAYERS)}
+        groups = {name: list(modules[name].parameters()) + list(modules[name].buffers())
+                  for name in leaves}
+        parameters = go._gather_parameters_with_no_group_offloading_parent(module, leaves)
+        buffers = go._gather_buffers_with_no_group_offloading_parent(module, leaves)
+        for name, tensor in list(parameters) + list(buffers):
+            parent = go._find_parent_module_in_module_dict(name, modules)
+            groups.setdefault(parent, []).append(tensor)
+        if not groups:
+            return False
+        dtypes = {"torch.bfloat16": "BF16", "torch.float16": "F16", "torch.float32": "F32",
+                  "torch.float64": "F64", "torch.int64": "I64", "torch.int32": "I32",
+                  "torch.int16": "I16", "torch.int8": "I8", "torch.uint8": "U8", "torch.bool": "BOOL"}
+        for name, tensors in groups.items():
+            tensors = list(dict.fromkeys(tensors))  # ModuleGroup.tensor_to_key order
+            path = os.path.join(cache_dir, f"group_{go._compute_group_hash(name)}.safetensors")
+            if os.path.islink(path) or not os.path.isfile(path):
+                return False
+            with safe_open(path, framework="numpy") as cached:
+                if set(cached.keys()) != {f"tensor_{i}" for i in range(len(tensors))}:
+                    return False
+                for i, tensor in enumerate(tensors):
+                    view = cached.get_slice(f"tensor_{i}")
+                    if (view.get_shape() != list(tensor.shape)
+                            or view.get_dtype() != dtypes.get(str(tensor.dtype))):
+                        return False
+        return True
+    except Exception:
+        # Inspection is optional; failed inspection must never reduce the budget.
+        return False
+
+
 def _plan_minimax_h3_image_offload(
     *,
     total_vram_gb: float,
@@ -4080,6 +4128,8 @@ def _plan_minimax_h3_image_offload(
     dit_weight_logical_bytes: Optional[int] = None,
     te_weight_measured: bool = False,
     dit_weight_measured: bool = False,
+    te_cache_compatible: bool = False,
+    defer_disk_check: bool = False,
     existing_te_cache_allocated_bytes: int = 0,
     existing_dit_cache_allocated_bytes: int = 0,
     offload_root: str = "",
@@ -4154,7 +4204,7 @@ def _plan_minimax_h3_image_offload(
         warnings.append(
             "发现已有 text_encoder group 缓存约 "
             f"{_bytes_to_gb_label(int(existing_te_cache_allocated_bytes))}。"
-            "仅当 group 哈希完全一致时 Diffusers 才会跳过重写；本检查不把该缓存算作已腾出的磁盘。"
+            "仅当所有预期 group 的哈希、键、形状和类型均匹配时才减少新增写盘预算。"
         )
     if inv.get("root_is_symlink") or (inv.get("text_encoder") or {}).get("is_symlink") or (inv.get("transformer") or {}).get("is_symlink"):
         warnings.append("offload 缓存路径或其子目录是软链，已跳过扫描且不会自动删除。")
@@ -4176,11 +4226,12 @@ def _plan_minimax_h3_image_offload(
             + cleanup
         )
 
-    required_disk_bytes = te_bytes + _H3_IMAGE_DISK_WRITE_RESERVE_BYTES
+    new_cache_bytes = 0 if te_cache_compatible else te_bytes
+    required_disk_bytes = new_cache_bytes + _H3_IMAGE_DISK_WRITE_RESERVE_BYTES
     estimates["required_disk_bytes"] = required_disk_bytes
     estimates["disk_free_bytes"] = int(disk_free_bytes) if disk_free_bytes is not None else None
-    # 不把已有 encoder 缓存从需求里扣除：哈希不一致时会再写一份，旧文件仍占空间。
-    if disk_free_bytes is None or int(disk_free_bytes) < required_disk_bytes:
+    # With candidate files, defer only until the encoder is available for exact group inspection.
+    if not defer_disk_check and (disk_free_bytes is None or int(disk_free_bytes) < required_disk_bytes):
         free_label = "未知" if disk_free_bytes is None else _bytes_to_gb_label(int(disk_free_bytes))
         leftover = int(existing_te_cache_allocated_bytes) + int(existing_dit_cache_allocated_bytes)
         leftover_note = (
@@ -4192,7 +4243,7 @@ def _plan_minimax_h3_image_offload(
         raise RuntimeError(
             "磁盘剩余空间不足以写入 text_encoder 的 group offload 缓存，已提前停止，以免再次写满磁盘。\n"
             f"磁盘剩余 {free_label}，估计需要再写入 encoder 缓存 "
-            f"{_bytes_to_gb_label(te_bytes)}（来源：{te_src}）"
+            f"{_bytes_to_gb_label(new_cache_bytes)}（来源：{te_src}）"
             f" + 写盘余量 {_bytes_to_gb_label(_H3_IMAGE_DISK_WRITE_RESERVE_BYTES)} "
             f"= {_bytes_to_gb_label(required_disk_bytes)}。\n"
             "该估计不是推理峰值，也不保证 group 文件与分片大小完全相等。\n"
@@ -4310,7 +4361,7 @@ def load_minimax_h3_image_pipeline(
       采用官方 ComponentsManager(enable_auto_cpu_offload) 在 DDR5 系统内存与显存间整块极速轮换；
     - 中等显存但可用 RAM>=132GB：按组件顺序加载并挂载 Diffusers Group Offloading（两件都在 CPU 内存，leaf_level + use_stream）+ 4K VAE Tiling；
     - 可用 RAM<132GB（如 A100 40GB Standard）：encoder 磁盘 group offload，DiT 常驻 CPU 内存 group offload（关闭 use_stream），VAE 仍只在内存；
-      加载前按分片大小做磁盘/内存预检查，空间不足则提前失败并给出手动清理缓存说明，绝不自动删除官方权重。
+      加载前按分片大小做内存预检查；已有缓存须在 encoder 装入后核对 group，写盘前检查磁盘，空间不足则提前失败并给出手动清理缓存说明，绝不自动删除官方权重。
       资源数字为分片逻辑大小加固定余量，不是实测加载或 4K/参考图峰值。
     """
     if total_vram_gb < 22.0:
@@ -4367,7 +4418,7 @@ def load_minimax_h3_image_pipeline(
     dit_weight = _measure_h3_image_catalog_weight_bytes(target_id, "transformer_diffusers/")
     cache_inventory = _inventory_h3_image_offload_cache(offload_root)
     disk_free_bytes = _disk_free_bytes_for_path(offload_root)
-    plan = _plan_minimax_h3_image_offload(
+    plan_kwargs = dict(
         total_vram_gb=total_vram_gb,
         avail_ram_gb=avail_ram_gb,
         disk_free_bytes=disk_free_bytes,
@@ -4381,8 +4432,9 @@ def load_minimax_h3_image_pipeline(
         official_weights_hint=official_weights_hint,
         cache_inventory=cache_inventory,
     )
+    has_te_cache = bool((cache_inventory.get("text_encoder") or {}).get("file_count"))
+    plan = _plan_minimax_h3_image_offload(**plan_kwargs, defer_disk_check=has_te_cache)
     _log_h3_image_offload_plan(plan, total_vram_gb, avail_ram_gb)
-    _write_h3_image_offload_policy_marker(offload_root, plan)
 
     pipe = ModularPipeline.from_pretrained(assembled_dir)
     MODEL_DOWNLOAD_STATE["progress"] = 0.42
@@ -4401,6 +4453,12 @@ def load_minimax_h3_image_pipeline(
         MODEL_DOWNLOAD_STATE["message"] = message
         pipe.load_components(names=component, dtype=torch.bfloat16)
         module = getattr(pipe, component)
+        if component == "text_encoder" and plan.get("te_offload_to_disk"):
+            compatible = (has_te_cache and not os.path.islink(offload_root)
+                          and _h3_image_te_cache_is_compatible(module, step["offload_to_disk_path"]))
+            plan_kwargs["disk_free_bytes"] = _disk_free_bytes_for_path(offload_root)
+            plan = _plan_minimax_h3_image_offload(**plan_kwargs, te_cache_compatible=compatible)
+            _write_h3_image_offload_policy_marker(offload_root, plan)
         if step["enable_tiling"] and hasattr(module, "enable_tiling"):
             module.enable_tiling()
         disk_path = step["offload_to_disk_path"]
