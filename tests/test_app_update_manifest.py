@@ -2,6 +2,7 @@ import io
 import json
 import os
 import stat
+import struct
 import sys
 import tempfile
 import unittest
@@ -134,7 +135,7 @@ class ZipSafetyTest(unittest.TestCase):
             path = self._make_zip(
                 tmp,
                 {
-                    "EasyColab.app/Contents/MacOS/EasyColab": b"binary",
+                    "EasyColab.app/Contents/MacOS/EasyColab": struct.pack("<8I", 0xFEEDFACF, 0x0100000C, 0, 2, 0, 0, 0, 0),
                     "EasyColab.app/Contents/Info.plist": b"<plist/>",
                     "__MACOSX/EasyColab.app/._Info.plist": b"rsrc",
                 },
@@ -147,7 +148,7 @@ class ZipSafetyTest(unittest.TestCase):
             slip = self._make_zip(
                 tmp,
                 {
-                    "EasyColab.app/Contents/MacOS/EasyColab": b"binary",
+                    "EasyColab.app/Contents/MacOS/EasyColab": struct.pack("<8I", 0xFEEDFACF, 0x0100000C, 0, 2, 0, 0, 0, 0),
                     "../outside.txt": b"pwn",
                 },
             )
@@ -157,7 +158,7 @@ class ZipSafetyTest(unittest.TestCase):
 
             link = self._make_zip(
                 tmp,
-                {"EasyColab.app/Contents/MacOS/EasyColab": b"binary"},
+                {"EasyColab.app/Contents/MacOS/EasyColab": struct.pack("<8I", 0xFEEDFACF, 0x0100000C, 0, 2, 0, 0, 0, 0)},
                 symlink_name="EasyColab.app/Contents/Resources/link",
             )
             result = lib.inspect_zip(link)

@@ -457,27 +457,79 @@ func inspectMachOArchitectures(at url: URL) throws -> [String] {
     let data = try Data(contentsOf: url, options: [.mappedIfSafe])
     guard data.count >= 8 else { throw AppUpdateError.bundleValidation(["binary_too_small"]) }
     let magic = u32BE(data, 0)
-    // Fat (CAFEBABE / BEBAFECA) or thin 64-bit (FEEDFACF / CFFAEDFE)
-    if magic == 0xCAFEBABE || magic == 0xBEBAFECA {
-        let swap = magic == 0xBEBAFECA
-        let nfat = swap ? u32(data, 4) : u32BE(data, 4)
-        var arches: [String] = []
-        var offset = 8
-        for _ in 0..<nfat {
-            guard offset + 20 <= data.count else { break }
-            let cpu = swap ? u32(data, offset) : u32BE(data, offset)
-            if let name = cpuTypeName(cpu) { arches.append(name) }
-            offset += 20
+    let isFat = [UInt32(0xCAFEBABE), 0xBEBAFECA, 0xCAFEBABF, 0xBFBAFECA].contains(magic)
+    if !isFat { return [try inspectThinMachO(data, offset: 0, size: data.count)] }
+    let little = magic == 0xBEBAFECA || magic == 0xBFBAFECA
+    let wide = magic == 0xCAFEBABF || magic == 0xBFBAFECA
+    let read32: (Int) -> UInt32 = { little ? u32(data, $0) : u32BE(data, $0) }
+    let count = Int(read32(4))
+    let rowSize = wide ? 32 : 20
+    guard count > 0, count <= (data.count - 8) / rowSize else {
+        throw AppUpdateError.bundleValidation(["invalid_fat_table"])
+    }
+    let tableEnd = 8 + count * rowSize
+    var arches: [String] = []
+    var ranges: [Range<Int>] = []
+    for i in 0..<count {
+        let row = 8 + i * rowSize
+        let cpu = read32(row)
+        let start = wide ? u64Value(data, row + 8, little: little) : UInt64(read32(row + 8))
+        let size = wide ? u64Value(data, row + 16, little: little) : UInt64(read32(row + 12))
+        let align = read32(row + (wide ? 24 : 16))
+        guard start >= UInt64(tableEnd), start <= UInt64(data.count), size >= 32,
+              size <= UInt64(data.count) - start, align <= 63,
+              start % (UInt64(1) << align) == 0 else {
+            throw AppUpdateError.bundleValidation(["invalid_fat_slice_bounds"])
         }
-        return arches
+        let range = Int(start)..<Int(start + size)
+        guard !ranges.contains(where: { $0.overlaps(range) }) else {
+            throw AppUpdateError.bundleValidation(["overlapping_fat_slices"])
+        }
+        ranges.append(range)
+        let arch = try inspectThinMachO(data, offset: Int(start), size: Int(size), expectedCPU: cpu)
+        guard !arches.contains(arch) else {
+            throw AppUpdateError.bundleValidation(["duplicate_fat_architecture"])
+        }
+        arches.append(arch)
     }
-    let thin = magic == 0xFEEDFACF || magic == 0xCFFAEDFE || magic == 0xFEEDFACE || magic == 0xCEFAEDFE
-    if thin {
-        let swap = magic == 0xCFFAEDFE || magic == 0xCEFAEDFE
-        let cpu = swap ? u32(data, 4) : u32BE(data, 4)
-        if let name = cpuTypeName(cpu) { return [name] }
+    return arches
+}
+
+private func inspectThinMachO(_ data: Data, offset: Int, size: Int, expectedCPU: UInt32? = nil) throws -> String {
+    guard size >= 32 else { throw AppUpdateError.bundleValidation(["truncated_macho_header"]) }
+    let magic = u32BE(data, offset)
+    guard magic == 0xFEEDFACF || magic == 0xCFFAEDFE else {
+        throw AppUpdateError.bundleValidation(["unsupported_macho_magic"])
     }
-    throw AppUpdateError.bundleValidation(["unrecognized_macho"])
+    let little = magic == 0xCFFAEDFE
+    let read32: (Int) -> UInt32 = { little ? u32(data, offset + $0) : u32BE(data, offset + $0) }
+    let cpu = read32(4)
+    guard let arch = cpuTypeName(cpu), expectedCPU == nil || expectedCPU == cpu, read32(12) == 2 else {
+        throw AppUpdateError.bundleValidation(["unsupported_macho_cpu_or_type"])
+    }
+    let count = Int(read32(16))
+    let commandBytes = Int(read32(20))
+    guard commandBytes <= size - 32, count <= commandBytes / 8 else {
+        throw AppUpdateError.bundleValidation(["truncated_load_commands"])
+    }
+    var cursor = 32
+    let end = 32 + commandBytes
+    for _ in 0..<count {
+        guard end - cursor >= 8 else { throw AppUpdateError.bundleValidation(["truncated_load_command"]) }
+        let commandSize = Int(read32(cursor + 4))
+        guard commandSize >= 8, commandSize % 8 == 0, commandSize <= end - cursor else {
+            throw AppUpdateError.bundleValidation(["invalid_load_command_size"])
+        }
+        cursor += commandSize
+    }
+    guard cursor == end else { throw AppUpdateError.bundleValidation(["load_command_size_mismatch"]) }
+    return arch
+}
+
+private func u64Value(_ data: Data, _ offset: Int, little: Bool) -> UInt64 {
+    let first = UInt64(little ? u32(data, offset) : u32BE(data, offset))
+    let second = UInt64(little ? u32(data, offset + 4) : u32BE(data, offset + 4))
+    return little ? first | (second << 32) : (first << 32) | second
 }
 
 private func u32BE(_ data: Data, _ offset: Int) -> UInt32 {
@@ -488,9 +540,8 @@ private func u32BE(_ data: Data, _ offset: Int) -> UInt32 {
 }
 
 private func cpuTypeName(_ cpu: UInt32) -> String? {
-    let raw = cpu & 0xFF
-    if raw == 0x0C { return "arm64" } // CPU_TYPE_ARM64
-    if raw == 0x07 { return "x86_64" } // CPU_TYPE_X86
+    if cpu == 0x0100000C { return "arm64" }
+    if cpu == 0x01000007 { return "x86_64" }
     return nil
 }
 
