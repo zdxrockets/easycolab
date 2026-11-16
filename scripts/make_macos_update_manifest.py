@@ -22,7 +22,7 @@ def main() -> int:
     parser.add_argument("--out", required=True)
     parser.add_argument("--notes", default="")
     parser.add_argument("--built-at", default="")
-    parser.add_argument("--universal", action="store_true", default=True)
+    parser.add_argument("--universal", action="store_true", help="require both arm64 and x86_64 slices")
     args = parser.parse_args()
 
     zip_path = Path(args.zip)
@@ -32,6 +32,10 @@ def main() -> int:
     inspect = lib.inspect_zip(str(zip_path))
     if not inspect["ok"]:
         print(f"zip failed safety inspection: {inspect['errors']}", file=sys.stderr)
+        return 1
+    universal = set(inspect["architectures"]) == {"arm64", "x86_64"}
+    if args.universal and not universal:
+        print("--universal requires valid arm64 and x86_64 executable slices", file=sys.stderr)
         return 1
     sha = lib.sha256_file(str(zip_path))
     url = (
@@ -46,7 +50,7 @@ def main() -> int:
         asset_url=url,
         notes=args.notes,
         built_at=args.built_at,
-        universal=True,
+        universal=universal,
     )
     out = Path(args.out)
     out.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
