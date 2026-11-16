@@ -1,0 +1,26 @@
+name: Python tests
+
+on:
+  pull_request:
+  push:
+    paths:
+      - "tests/**"
+      - "scripts/**"
+      - "macos_app/build_macos_app.sh"
+      - ".github/workflows/python-tests.yml"
+      - ".github/workflows/macos-release.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    name: Unit tests (no macOS build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run focused tests
+        run: python3 -m unittest tests.test_app_update_manifest tests.test_app_update_packaging -v

@@ -1,0 +1,106 @@
+name: Build EasyColab macOS Release
+
+# Expensive macOS runners only run for a version tag or a manual dispatch
+# that names an existing tag. Pushing master (including fork syncs) does not
+# build or publish.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing git tag to build and attach (for example v1.1.2)"
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-universal:
+    name: Build Universal macOS zip and manifest
+    runs-on: macos-14
+    if: github.event_name == 'push' || inputs.tag != ''
+    steps:
+      - name: Resolve tag and version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${{ inputs.tag }}"
+          fi
+          TAG="${TAG#refs/tags/}"
+          case "${TAG}" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "Tag must look like v1.2.3, got: ${TAG}"
+              exit 1
+              ;;
+          esac
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${TAG#v}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Require VERSION file to match the tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE_VER="$(tr -d '[:space:]' < VERSION)"
+          EXPECTED="${{ steps.meta.outputs.version }}"
+          if [ "${FILE_VER}" != "${EXPECTED}" ]; then
+            echo "VERSION file is '${FILE_VER}' but the tag version is '${EXPECTED}'."
+            echo "Bump VERSION and commit it before tagging so the client and the release agree."
+            exit 1
+          fi
+
+      - name: Build Universal EasyColab.app
+        env:
+          APP_VERSION: ${{ steps.meta.outputs.version }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: bash macos_app/build_macos_app.sh
+
+      - name: Write update manifest and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/make_macos_update_manifest.py \
+            --zip EasyColab-macOS.zip \
+            --version "${{ steps.meta.outputs.version }}" \
+            --tag "${{ steps.meta.outputs.tag }}" \
+            --commit "$(git rev-parse HEAD)" \
+            --out EasyColab-macOS.manifest.json \
+            --built-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          shasum -a 256 EasyColab-macOS.zip EasyColab-macOS.manifest.json > SHA256SUMS
+          cat EasyColab-macOS.manifest.json
+          cat SHA256SUMS
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: EasyColab-macOS
+          path: |
+            EasyColab-macOS.zip
+            EasyColab-macOS.manifest.json
+            SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach files to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          files: |
+            EasyColab-macOS.zip
+            EasyColab-macOS.manifest.json
+            SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true

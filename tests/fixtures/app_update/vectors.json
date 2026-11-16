@@ -1,0 +1,70 @@
+{
+  "repo": "zdxrockets/easycolab",
+  "bundle_id": "app.easycolab.studio.macos",
+  "version_cases": [
+    {
+      "name": "unstamped_110_vs_112",
+      "current": {"version": "1.1.0", "git_commit": ""},
+      "candidate": {"version": "1.1.2", "release_tag": "v1.1.2", "git_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      "expect_newer": true,
+      "expect_status": "newer_version"
+    },
+    {
+      "name": "official_111_mislabeled_110_vs_same_110_release",
+      "current": {"version": "1.1.0", "git_commit": ""},
+      "candidate": {"version": "1.1.0", "release_tag": "v1.1.0", "git_commit": "fcad66f0d766194ad65ce1843bd624a43010721a"},
+      "expect_newer": false,
+      "expect_status": "same_version_unstamped"
+    },
+    {
+      "name": "stamped_equal_commit",
+      "current": {"version": "1.1.2", "git_commit": "abc1234def"},
+      "candidate": {"version": "1.1.2", "release_tag": "v1.1.2", "git_commit": "abc1234def999999"},
+      "expect_newer": false,
+      "expect_status": "same_build"
+    },
+    {
+      "name": "stamped_same_version_new_commit",
+      "current": {"version": "1.1.2", "git_commit": "1111111111111111111111111111111111111111"},
+      "candidate": {"version": "1.1.2", "release_tag": "v1.1.2", "git_commit": "2222222222222222222222222222222222222222"},
+      "expect_newer": true,
+      "expect_status": "same_version_different_build"
+    },
+    {
+      "name": "installed_newer_than_release",
+      "current": {"version": "1.2.0", "git_commit": "cccccccccccccccccccccccccccccccccccccccc"},
+      "candidate": {"version": "1.1.9", "release_tag": "v1.1.9", "git_commit": "dddddddddddddddddddddddddddddddddddddddd"},
+      "expect_newer": false,
+      "expect_status": "older_or_equal"
+    },
+    {
+      "name": "unparsed_version",
+      "current": {"version": "dev", "git_commit": ""},
+      "candidate": {"version": "latest", "release_tag": "latest", "git_commit": ""},
+      "expect_newer": false,
+      "expect_status": "incomparable"
+    }
+  ],
+  "url_cases": [
+    {"url": "https://api.github.com/repos/zdxrockets/easycolab/releases", "kind": "api", "ok": true},
+    {"url": "https://api.github.com/repos/zdxrockets/easycolab/releases/latest", "kind": "api", "ok": true},
+    {"url": "https://api.github.com/repos/wy51ai/easycolab/releases", "kind": "api", "ok": false},
+    {"url": "http://api.github.com/repos/zdxrockets/easycolab/releases", "kind": "api", "ok": false},
+    {"url": "https://evil.example/repos/zdxrockets/easycolab/releases", "kind": "api", "ok": false},
+    {"url": "https://github.com/zdxrockets/easycolab/releases/download/v1.1.2/EasyColab-macOS.zip", "kind": "download", "ok": true},
+    {"url": "https://github.com/wy51ai/easycolab/releases/download/v1.1.1/EasyColab-macOS.zip", "kind": "download", "ok": false},
+    {"url": "https://github.com/zdxrockets/easycolab/releases/download/v1.1.2/../EasyColab-macOS.zip", "kind": "download", "ok": false},
+    {"url": "https://github.com/zdxrockets/easycolab/releases/download/v1.1.2/evil.exe", "kind": "download", "ok": false},
+    {"url": "https://github.com/zdxrockets/easycolab/releases/download/v1.1.2/EasyColab-macOS.zip?token=abc", "kind": "download", "ok": false},
+    {"url": "https://user:pass@github.com/zdxrockets/easycolab/releases/download/v1.1.2/EasyColab-macOS.zip", "kind": "download", "ok": false}
+  ],
+  "zip_path_cases": [
+    {"name": "EasyColab.app/Contents/MacOS/EasyColab", "ok": true},
+    {"name": "EasyColab.app/Contents/Info.plist", "ok": true},
+    {"name": "__MACOSX/EasyColab.app/._Info.plist", "ok": true},
+    {"name": "../Evil.app/Contents/MacOS/EasyColab", "ok": false, "reason": "dotdot"},
+    {"name": "/tmp/EasyColab.app/Contents/MacOS/EasyColab", "ok": false, "reason": "absolute"},
+    {"name": "Other.app/Contents/MacOS/EasyColab", "ok": false, "reason": "unexpected_root"},
+    {"name": "EasyColab.app/Contents/MacOS/../../../tmp/x", "ok": false, "reason": "dotdot"}
+  ]
+}
