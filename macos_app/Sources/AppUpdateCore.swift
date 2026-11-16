@@ -358,12 +358,12 @@ func zipEntryIsSafe(_ name: String, isSymlink: Bool = false, isEncrypted: Bool =
 func inspectZipCentralDirectory(at url: URL) throws -> [ZipEntryInfo] {
     let data = try Data(contentsOf: url, options: [.mappedIfSafe])
     guard data.count >= 22 else { throw AppUpdateError.unsafeZip(["zip_too_small"]) }
-    // Reject ZIP64 locator signature near the end.
-    if data.range(of: Data([0x50, 0x4b, 0x06, 0x07])) != nil {
-        throw AppUpdateError.unsafeZip(["zip64_unsupported"])
-    }
     guard let eocd = findEndOfCentralDirectory(data) else {
         throw AppUpdateError.unsafeZip(["missing_eocd"])
+    }
+    if eocd.totalEntries == 0xFFFF || eocd.cdOffset == 0xFFFFFFFF || eocd.cdSize == 0xFFFFFFFF
+        || hasZip64Locator(data, eocd: eocd) {
+        throw AppUpdateError.unsafeZip(["zip64_unsupported"])
     }
     var entries: [ZipEntryInfo] = []
     var offset = eocd.cdOffset
@@ -412,6 +412,23 @@ func validateZipEntries(_ entries: [ZipEntryInfo]) -> [String] {
 private struct EOCD {
     var totalEntries: UInt16
     var cdOffset: Int
+    var cdSize: Int
+    var position: Int
+}
+
+private func hasZip64Locator(_ data: Data, eocd: EOCD) -> Bool {
+    // A locator belongs immediately before EOCD, outside the central directory.
+    // Bytes in stored content or either kind of ZIP comment are not locators.
+    let locator = eocd.position - 20
+    guard locator >= 0, eocd.cdOffset <= locator,
+          eocd.cdSize <= locator - eocd.cdOffset,
+          u32(data, locator) == 0x07064b50 else { return false }
+    let record = u64Value(data, locator + 8, little: true)
+    guard record <= UInt64(locator), UInt64(locator) - record >= 56 else { return false }
+    let start = Int(record)
+    guard u32(data, start) == 0x06064b50 else { return false }
+    let recordSize = u64Value(data, start + 4, little: true)
+    return recordSize >= 44 && recordSize == UInt64(locator - start - 12)
 }
 
 private func findEndOfCentralDirectory(_ data: Data) -> EOCD? {
@@ -425,7 +442,8 @@ private func findEndOfCentralDirectory(_ data: Data) -> EOCD? {
            data[i + 2] == signature[2], data[i + 3] == signature[3] {
             let commentLen = Int(u16(data, i + 20))
             if i + minSize + commentLen == data.count {
-                return EOCD(totalEntries: u16(data, i + 10), cdOffset: Int(u32(data, i + 16)))
+                return EOCD(totalEntries: u16(data, i + 10), cdOffset: Int(u32(data, i + 16)),
+                            cdSize: Int(u32(data, i + 12)), position: i)
             }
         }
         if i == 0 { break }
