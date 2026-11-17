@@ -32,6 +32,19 @@ class PackagingStaticTest(unittest.TestCase):
         self.assertNotIn("ghp_", service)
         self.assertNotIn("token", service.lower())
 
+    def test_download_destination_is_task_bound_and_moved_before_actor_hop(self):
+        service = (MACOS / "Sources/AppUpdateService.swift").read_text(encoding="utf-8")
+        setup = service.split("private func downloadFile(", 1)[1].split("private func installReplacingCurrentApp", 1)[0]
+        callback = service.split("didFinishDownloadingTo location: URL)", 1)[1].split("nonisolated func urlSession", 1)[0]
+        self.assertNotIn("downloadDestinationPath", service)
+        self.assertNotIn("downloadLock", service)
+        self.assertIn("task.taskDescription = destination.path", setup)
+        self.assertLess(setup.index("task.taskDescription = destination.path"), setup.index("task.resume()"))
+        self.assertIn("let destPath = downloadTask.taskDescription", callback)
+        self.assertLess(callback.index("let destPath = downloadTask.taskDescription"), callback.index("moveItem(at: location, to: dest)"))
+        self.assertLess(callback.index("moveItem(at: location, to: dest)"), callback.index("Task { @MainActor"))
+        self.assertNotIn("nonisolated(unsafe)", service)
+
     def test_ui_hooks_exist(self):
         main = (MACOS / "Sources/MainStudioView.swift").read_text(encoding="utf-8")
         studio = (MACOS / "EasyColabStudio.swift").read_text(encoding="utf-8")

@@ -35,8 +35,6 @@ final class AppUpdateController: NSObject, ObservableObject {
     private var session: URLSession!
     private var downloadProgress: Double = 0
     private var downloadContinuation: CheckedContinuation<URL, Error>?
-    private let downloadLock = NSLock()
-    private var downloadDestinationPath: String?
 
     override init() {
         currentIdentity = AppVersionIdentity.loadFromBundle()
@@ -240,12 +238,10 @@ final class AppUpdateController: NSObject, ObservableObject {
 
     private func downloadFile(from url: URL, to destination: URL) async throws -> URL {
         try await withCheckedThrowingContinuation { continuation in
-            self.downloadLock.lock()
-            self.downloadDestinationPath = destination.path
-            self.downloadLock.unlock()
             self.downloadContinuation = continuation
             self.downloadProgress = 0
             let task = self.session.downloadTask(with: url)
+            task.taskDescription = destination.path
             task.resume()
         }
     }
@@ -347,9 +343,7 @@ extension AppUpdateController: URLSessionTaskDelegate, URLSessionDownloadDelegat
 
     nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         // The temporary file is deleted when this method returns; move it synchronously.
-        downloadLock.lock()
-        let destPath = downloadDestinationPath
-        downloadLock.unlock()
+        let destPath = downloadTask.taskDescription
         do {
             guard let destPath else {
                 throw NSError(domain: "EasyColabUpdater", code: -1, userInfo: [NSLocalizedDescriptionKey: "missing download destination"])
