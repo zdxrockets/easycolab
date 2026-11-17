@@ -1,0 +1,122 @@
+name: PR1 macOS test package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-pr1:
+    if: github.repository == 'zdxrockets/easycolab' && github.ref == 'refs/heads/master'
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: cdc660a6e85356590772a980e5d41770fc60520d
+      APP_PY_SHA256: 817957d0b0cecbf4a666eaf99fedfa7bb14954f5aecf1408ed6ba2726b612a0d
+      TEST_LABEL: EasyColab PR1 TEST cdc660a
+      WORKFLOW_SHA: ${{ github.sha }}
+    steps:
+      - name: Checkout fixed PR1 source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: cdc660a6e85356590772a980e5d41770fc60520d
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Compile, identify, sign and verify the test archive
+        shell: bash
+        run: |
+          python3 - <<'PY_BUILD'
+          import hashlib, json, os, pathlib, plistlib, shutil, stat, subprocess
+          p = pathlib.Path.cwd()
+          sha = os.environ['SOURCE_SHA']
+          expected = os.environ['APP_PY_SHA256']
+          label = os.environ['TEST_LABEL']
+          def run(*args, capture=False):
+              return subprocess.run(args, check=True, text=True, capture_output=capture)
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+          assert run('git', 'rev-parse', 'HEAD', capture=True).stdout.strip() == sha
+          assert digest(p / 'app.py') == expected
+          run('bash', '-n', 'macos_app/build_macos_app.sh')
+          run('python3', '-m', 'unittest', 'tests.test_h3_image_offload_plan', '-v')
+          run('bash', 'macos_app/build_macos_app.sh')
+          app = p / 'EasyColab-PR1-Test.app'
+          (p / 'EasyColab.app').rename(app)
+          resources = app / 'Contents/Resources'
+          binary = app / 'Contents/MacOS/EasyColab'
+          assert digest(resources / 'app.py') == expected
+          arches = sorted(run('lipo', '-archs', str(binary), capture=True).stdout.split())
+          if arches == ['arm64', 'x86_64']:
+              arch_label = 'universal'
+          elif arches in (['arm64'], ['x86_64']):
+              arch_label = arches[0]
+          else:
+              raise RuntimeError('Unexpected executable architectures')
+          file_description = run('file', str(binary), capture=True).stdout.strip()
+          print(file_description)
+          info_path = app / 'Contents/Info.plist'
+          info = plistlib.loads(info_path.read_bytes())
+          source_version = (p / 'VERSION').read_text().strip()
+          assert info['CFBundleShortVersionString'] == source_version
+          info['CFBundleDisplayName'] = label
+          info['CFBundleName'] = 'EasyColab PR1 Test'
+          info['EasyColabTestBuild'] = True
+          info['EasyColabSourceCommit'] = sha
+          info_path.write_bytes(plistlib.dumps(info))
+          resource_names = ['VERSION', 'app.py', 'runtime_auth.py', 'colab_bridge.py', 'EasyColab_Server.ipynb', 'requirements.txt']
+          for name in resource_names:
+              assert (resources / name).read_bytes() == (p / name).read_bytes()
+          manifest = {
+              'test_label': label,
+              'source_commit': sha,
+              'source_version': source_version,
+              'workflow_commit': os.environ['WORKFLOW_SHA'],
+              'app_py_sha256': expected,
+              'resource_sha256': {name: digest(resources / name) for name in resource_names},
+              'architectures': arches,
+              'file_description': file_description,
+              'bundle_metadata_overrides': ['CFBundleDisplayName', 'CFBundleName', 'EasyColabTestBuild', 'EasyColabSourceCommit'],
+              'signing': {'type': 'ad-hoc', 'developer_id': False, 'verification': 'codesign --verify --deep --strict'},
+              'notarization': {'notarized': False, 'submitted': False},
+              'validation_limits': ['No GUI launch or installation test', 'No Colab or A100 test'],
+          }
+          manifest_path = resources / 'build-manifest.json'
+          manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+          run('codesign', '--force', '--deep', '--sign', '-', str(app))
+          run('codesign', '--verify', '--deep', '--strict', '--verbose=2', str(app))
+          signature = run('codesign', '--display', '--verbose=4', str(app), capture=True)
+          signing_details = signature.stdout + signature.stderr
+          assert 'Signature=adhoc' in signing_details
+          assert 'Authority=Developer ID' not in signing_details
+          out = p / 'test-artifact'
+          out.mkdir()
+          archive = out / f'EasyColab-PR1-test-cdc660a-{arch_label}.zip'
+          run('ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(app), str(archive))
+          extracted = p / 'archive-verification'
+          extracted.mkdir()
+          run('ditto', '-x', '-k', str(archive), str(extracted))
+          restored = extracted / app.name
+          restored_binary = restored / 'Contents/MacOS/EasyColab'
+          assert digest(restored / 'Contents/Resources/app.py') == expected
+          assert (restored / 'Contents/Resources/build-manifest.json').read_bytes() == manifest_path.read_bytes()
+          assert digest(restored_binary) == digest(binary)
+          assert stat.S_IMODE(restored_binary.stat().st_mode) & 0o111
+          for name in resource_names:
+              assert (restored / 'Contents/Resources' / name).read_bytes() == (p / name).read_bytes()
+          def symlinks(root):
+              return {str(f.relative_to(root)): os.readlink(f) for f in root.rglob('*') if f.is_symlink()}
+          assert symlinks(app) == symlinks(restored)
+          run('codesign', '--verify', '--deep', '--strict', '--verbose=2', str(restored))
+          shutil.copy2(manifest_path, out / 'build-manifest.json')
+          (out / 'codesign-details.txt').write_text(signing_details)
+          (out / 'SHA256SUMS.txt').write_text(digest(archive) + '  ' + archive.name + '\n')
+          print(json.dumps({'archive': archive.name, 'architectures': arches, 'archive_sha256': digest(archive), 'app_py_sha256': expected}))
+          PY_BUILD
+      - name: Upload test download package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: EasyColab-PR1-test-cdc660a
+          path: test-artifact/
+          if-no-files-found: error
+          retention-days: 7
