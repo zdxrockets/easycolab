@@ -8,6 +8,7 @@ import ObjectiveC.runtime
 
 struct MainStudioView: View {
     @StateObject var vm = StudioViewModel()
+    @StateObject var updater = AppUpdateController()
     @ObservedObject var i18n = LanguageManager.shared
     @Environment(\.colorScheme) var colorScheme
     @State var showFileList: Bool = false
@@ -39,6 +40,10 @@ struct MainStudioView: View {
                     .fill(palette.splitDivider)
                     .frame(height: 1)
                 sidebarPanel(palette: palette)
+                Divider().padding(.horizontal, 14)
+                AppUpdateSidebarFooter(updater: updater)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
             }
             .frame(width: 356)
             .background(palette.sidebarBackground)
@@ -87,7 +92,21 @@ struct MainStudioView: View {
         .sheet(isPresented: $vm.showAddCustomModelSheet) {
             AddCustomHFModelMacSheet(vm: vm)
         }
+        .sheet(isPresented: $updater.showSheet) {
+            AppUpdateSheet(updater: updater)
+        }
         .onAppear {
+            updater.cloudTaskActive = {
+                vm.isWakingColab
+                    || vm.isDownloadingWeights
+                    || vm.isLoadingModel
+                    || vm.isUnloadingModel
+                    || vm.isGenerating
+                    || vm.comfyStarting
+                    || vm.comfyDownloadingWeight
+                    || vm.comfySyncingDrive
+                    || vm.comfyQueueRunning > 0
+            }
             if !UserDefaults.standard.bool(forKey: "hasSeenOnboardingGuide_v1") {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
                     vm.openOnboardingGuide(step: 0)
@@ -96,6 +115,9 @@ struct MainStudioView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .openEasyColabGuide)) { _ in
             vm.openOnboardingGuide(step: 0)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openEasyColabUpdater)) { _ in
+            updater.openSheet()
         }
         .alert(L("释放所有 Colab 实例？", "Release All Colab Instances?"), isPresented: $vm.showDisconnectConfirm) {
             Button(L("取消", "Cancel"), role: .cancel) {}

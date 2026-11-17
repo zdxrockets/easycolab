@@ -75,6 +75,8 @@ open EasyColab.app
 xattr -cr /Applications/EasyColab.app
 ```
 
+本 fork 的应用内「检查更新」只读取 [zdxrockets/easycolab Releases](https://github.com/zdxrockets/easycolab/releases) 中带 manifest 的 macOS 包，不检查上游 `wy51ai`。推送源码不会自动变成可安装包。说明见 [docs/macos-self-update.md](docs/macos-self-update.md)。
+
 ---
 
 ### Windows 客户端
