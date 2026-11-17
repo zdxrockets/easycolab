@@ -1,0 +1,189 @@
+name: TEST update 1.1.1 fixed PR1+PR2 macOS package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-update:
+    if: github.repository == 'zdxrockets/easycolab' && github.ref == 'refs/heads/master'
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      SOURCE_SHA: 890f275a8c0b316965d189b91562bc6eecc5cca7
+      APP_PY_SHA256: 817957d0b0cecbf4a666eaf99fedfa7bb14954f5aecf1408ed6ba2726b612a0d
+      TEST_LABEL: EasyColab TEST UPDATE 1.1.1 (PR1+PR2 890f275)
+      WORKFLOW_SHA: ${{ github.sha }}
+    steps:
+      - name: Checkout fixed application snapshot
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: 890f275a8c0b316965d189b91562bc6eecc5cca7
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up fixed test Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13.5'
+      - name: Install fixed regression dependencies
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/test-update-venv"
+          "$RUNNER_TEMP/test-update-venv/bin/python" -m pip install --disable-pip-version-check --index-url https://pypi.org/simple --only-binary=:all: numpy==2.2.6 safetensors==0.5.3
+          "$RUNNER_TEMP/test-update-venv/bin/python" -c "import sys, importlib.metadata as m; assert sys.version_info[:3] == (3, 13, 5); assert m.version('numpy') == '2.2.6'; assert m.version('safetensors') == '0.5.3'; print(sys.executable, sys.version)"
+          echo "$RUNNER_TEMP/test-update-venv/bin" >> "$GITHUB_PATH"
+      - name: Run regressions, build Universal TEST update and validate production updater preflight
+        shell: bash
+        run: |
+          python3 - <<'PY_BUILD'
+          import hashlib, json, os, pathlib, plistlib, shutil, stat, subprocess
+          p = pathlib.Path.cwd()
+          sha = os.environ['SOURCE_SHA']
+          expected = os.environ['APP_PY_SHA256']
+          label = os.environ['TEST_LABEL']
+          def run(*args, capture=False):
+              return subprocess.run(args, check=True, text=True, capture_output=capture)
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+          assert run('git', 'rev-parse', 'HEAD', capture=True).stdout.strip() == sha
+          assert digest(p / 'app.py') == expected
+          run('bash', '-n', 'macos_app/build_macos_app.sh')
+          import unittest
+          assert shutil.which('swiftc'), 'Real Swift compiler is required; skips are not accepted'
+          run('swiftc', '--version')
+          modules = ['tests.test_h3_image_offload_plan', 'tests.test_app_update_manifest', 'tests.test_app_update_packaging', 'tests.test_app_update_binary', 'tests.test_app_update_zip_structure', 'tests.test_app_update_arch_manifest']
+          class CompilerDiagnostics(unittest.TextTestResult):
+              def addError(self, test, error):
+                  failure = error[1]
+                  if isinstance(failure, subprocess.CalledProcessError):
+                      for captured in (failure.stdout, failure.stderr):
+                          if captured:
+                              self.stream.writeln(captured.decode(errors='replace') if isinstance(captured, bytes) else captured)
+                  super().addError(test, error)
+          suite = unittest.defaultTestLoader.loadTestsFromNames(modules)
+          result = unittest.TextTestRunner(verbosity=2, resultclass=CompilerDiagnostics).run(suite)
+          assert result.wasSuccessful() and not result.skipped and result.testsRun == 37, 'All integration tests must run and pass'
+          from tests.test_app_update_binary import binary_vectors
+          from tests.test_app_update_zip_structure import zip_vectors
+          test_evidence = {'tests_run': result.testsRun, 'skipped': len(result.skipped), 'swift_macho_vectors': len(binary_vectors()), 'swift_zip_vectors': len(zip_vectors()), 'swift_paths': 'Unmodified production AppUpdateCore functions compiled and executed'}
+          source_version = (p / 'VERSION').read_text().strip()
+          assert source_version == '1.1.0'
+          assert not run('git', 'diff', '--name-only', capture=True).stdout.strip()
+          (p / 'VERSION').write_text('1.1.1\n')
+          os.environ.update(APP_VERSION='1.1.1', RELEASE_TAG='1.1.1', GIT_COMMIT=sha)
+          assert run('git', 'diff', '--name-only', capture=True).stdout.strip() == 'VERSION'
+          run('bash', 'macos_app/build_macos_app.sh')
+          app = p / 'EasyColab.app'
+          resources = app / 'Contents/Resources'
+          binary = app / 'Contents/MacOS/EasyColab'
+          arches = sorted(run('lipo', '-archs', str(binary), capture=True).stdout.split())
+          assert arches == ['arm64', 'x86_64'], 'This TEST update requires a real Universal binary'
+          file_description = run('file', str(binary), capture=True).stdout.strip()
+          print(file_description)
+          info_path = app / 'Contents/Info.plist'
+          info = plistlib.loads(info_path.read_bytes())
+          assert info['CFBundleShortVersionString'] == info['CFBundleVersion'] == '1.1.1'
+          info.update(CFBundleDisplayName=label, CFBundleName='EasyColab TEST', EasyColabTestBuild=True, EasyColabSourceCommit=sha)
+          info_path.write_bytes(plistlib.dumps(info))
+          resource_names = ['VERSION', 'app.py', 'runtime_auth.py', 'colab_bridge.py', 'EasyColab_Server.ipynb', 'requirements.txt']
+          for name in resource_names:
+              assert (resources / name).read_bytes() == (p / name).read_bytes()
+          assert (resources / 'VERSION').read_text().strip() == '1.1.1'
+          assert digest(resources / 'app.py') == expected
+          build_info = json.loads((resources / 'EasyColabBuildInfo.json').read_text())
+          assert build_info['version'] == build_info['release_tag'] == '1.1.1'
+          assert build_info['git_commit'] == sha
+          manifest = {
+              'test_label': label, 'source_commit': sha, 'source_version': source_version,
+              'bundle_version': '1.1.1', 'release_tag': '1.1.1',
+              'workflow_commit': os.environ['WORKFLOW_SHA'], 'app_py_sha256': expected,
+              'metadata_overrides': {'runner_VERSION': '1.1.1', 'APP_VERSION': '1.1.1', 'RELEASE_TAG': '1.1.1', 'display_name': label},
+              'provenance_note': 'Unchanged application code from 890f275; runner-only version/test metadata overrides, not a new application source commit',
+              'regressions': test_evidence, 'architectures': arches, 'file_description': file_description,
+              'resource_sha256': {name: digest(resources / name) for name in resource_names},
+              'signing': {'type': 'ad-hoc', 'developer_id': False, 'verification': 'codesign --verify --deep --strict'},
+              'notarization': {'notarized': False, 'submitted': False},
+              'validation_limits': ['No user Mac installation/replacement/rollback test', 'No Gatekeeper acceptance test', 'No Colab/A100 test'],
+          }
+          manifest_path = resources / 'build-manifest.json'
+          manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+          run('codesign', '--force', '--deep', '--sign', '-', str(app))
+          run('codesign', '--verify', '--deep', '--strict', '--verbose=2', str(app))
+          signature = run('codesign', '--display', '--verbose=4', str(app), capture=True)
+          signing_details = signature.stdout + signature.stderr
+          assert 'Signature=adhoc' in signing_details and 'Authority=Developer ID' not in signing_details
+          out = p / 'test-update-artifact'
+          out.mkdir()
+          archive = out / 'EasyColab-macOS.zip'
+          run('ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(app), str(archive))
+          extracted = p / 'update-archive-verification'
+          extracted.mkdir()
+          run('ditto', '-x', '-k', str(archive), str(extracted))
+          restored = extracted / 'EasyColab.app'
+          restored_binary = restored / 'Contents/MacOS/EasyColab'
+          assert digest(restored_binary) == digest(binary)
+          assert stat.S_IMODE(restored_binary.stat().st_mode) & 0o111
+          for name in resource_names + ['EasyColabBuildInfo.json', 'build-manifest.json']:
+              assert (restored / 'Contents/Resources' / name).read_bytes() == (resources / name).read_bytes()
+          def symlinks(root):
+              return {str(f.relative_to(root)): os.readlink(f) for f in root.rglob('*') if f.is_symlink()}
+          assert symlinks(app) == symlinks(restored) == {}, 'Updater rejects symlinks'
+          run('codesign', '--verify', '--deep', '--strict', '--verbose=2', str(restored))
+          notes = 'TEST ONLY: PR1+PR2 source 890f275, runner version override 1.1.1. Ad-hoc signed, not Developer ID signed or notarized. Installation, replacement and backup/restore are NOT tested. No stable-quality guarantee. User confirmation required before installation.'
+          run('python3', 'scripts/make_macos_update_manifest.py', '--zip', str(archive), '--version', '1.1.1', '--tag', '1.1.1', '--commit', sha, '--out', str(out / 'EasyColab-macOS.manifest.json'), '--notes', notes, '--built-at', build_info['built_at'], '--universal')
+
+          service = (p / 'macos_app/Sources/AppUpdateService.swift').read_text()
+          selector = service.split('    private func pickLatestStableRelease(', 1)[1].split('    private func fetchManifest(', 1)[0]
+          selector = '    private func pickLatestStableRelease(' + selector
+          swift = 'import Foundation\nstruct ReleaseSelector {\n' + selector + '\nfunc select(_ releases: [[String: Any]]) -> [String: Any]? { pickLatestStableRelease(releases) }\n}\n'
+          swift += r'''
+          let manifestURL = URL(fileURLWithPath: CommandLine.arguments[1])
+          let archiveURL = URL(fileURLWithPath: CommandLine.arguments[2])
+          let appURL = URL(fileURLWithPath: CommandLine.arguments[3], isDirectory: true)
+          let update = try AppUpdateManifest.parse(data: Data(contentsOf: manifestURL))
+          let current = AppVersionIdentity(version: "1.1.0", releaseTag: "", gitCommit: "890f275a8c0b316965d189b91562bc6eecc5cca7", hasBuildStamp: true, bundleIdentifier: AppUpdateConfig.bundleIdentifier, minOS: "13.0")
+          let comparison = compareIdentities(current, update.identity)
+          precondition(comparison.newer && comparison.status == "newer_version")
+          precondition(update.version == "1.1.1" && update.releaseTag == "1.1.1" && update.universal)
+          precondition(isAllowedReleasesAPIURL(AppUpdateConfig.releasesAPIURL))
+          precondition(isAllowedDownloadURL(update.assetURL))
+          let checksum = try sha256Hex(ofFile: archiveURL)
+          precondition(checksum == update.assetSHA256)
+          let entries = try inspectZipCentralDirectory(at: archiveURL)
+          let zipErrors = validateZipEntries(entries)
+          precondition(zipErrors.isEmpty, "Production ZIP preflight failed: \(zipErrors)")
+          precondition(rejectSymlinksDeep(at: appURL.deletingLastPathComponent()) == nil)
+          let bundleErrors = validateExtractedApp(at: appURL, manifest: update, currentOS: ProcessInfo.processInfo.operatingSystemVersion)
+          precondition(bundleErrors.isEmpty, "Production bundle preflight failed: \(bundleErrors)")
+          let release: [String: Any] = ["tag_name": "1.1.1", "draft": false, "prerelease": false, "assets": [["name": AppUpdateConfig.assetName], ["name": AppUpdateConfig.manifestName]]]
+          var prerelease = release
+          prerelease["prerelease"] = true
+          var draft = release
+          draft["draft"] = true
+          let selected = ReleaseSelector().select([prerelease, draft, release])
+          precondition(selected?["tag_name"] as? String == "1.1.1")
+          precondition(ReleaseSelector().select([prerelease, draft]) == nil)
+          print("PRODUCTION_SWIFT_UPDATE_PREFLIGHT_OK")
+          '''
+          preflight = pathlib.Path(os.environ['RUNNER_TEMP']) / 'test-update-preflight'
+          preflight.mkdir()
+          (preflight / 'main.swift').write_text(swift)
+          run('swiftc', 'macos_app/Sources/AppUpdateCore.swift', str(preflight / 'main.swift'), '-o', str(preflight / 'preflight'))
+          check = run(str(preflight / 'preflight'), str(out / 'EasyColab-macOS.manifest.json'), str(archive), str(restored), capture=True)
+          assert 'PRODUCTION_SWIFT_UPDATE_PREFLIGHT_OK' in check.stdout
+          print(check.stdout)
+          (out / 'preflight-evidence.json').write_text(json.dumps({'production_swift_core': True, 'exact_source_release_selector': True, 'comparison': '1.1.0 890f275 -> 1.1.1 890f275', 'manifest_sha_zip_bundle_arch_checks': 'passed', 'installed': False, 'backup_restore_tested': False}, indent=2) + '\n')
+          shutil.copy2(manifest_path, out / 'build-manifest.json')
+          (out / 'codesign-details.txt').write_text(signing_details)
+          (out / 'SHA256SUMS.txt').write_text(digest(archive) + '  ' + archive.name + '\n')
+          print(json.dumps({'archive_sha256': digest(archive), 'architectures': arches, 'version': '1.1.1', 'source_commit': sha, 'production_swift_preflight': 'passed'}))
+          PY_BUILD
+      - name: Upload verified TEST update for separate release approval
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: EasyColab-TEST-update-1.1.1-890f275
+          path: test-update-artifact/
+          if-no-files-found: error
+          retention-days: 7
