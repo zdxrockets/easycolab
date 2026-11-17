@@ -12,15 +12,15 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 25
     env:
-      SOURCE_SHA: 7a24fbe6ecfedaa8ca4c2e59a70983db0ee2b8e5
+      SOURCE_SHA: 890f275a8c0b316965d189b91562bc6eecc5cca7
       APP_PY_SHA256: 817957d0b0cecbf4a666eaf99fedfa7bb14954f5aecf1408ed6ba2726b612a0d
-      TEST_LABEL: EasyColab PR1+PR2 INTEGRATION TEST 7a24fbe
+      TEST_LABEL: EasyColab PR1+PR2 INTEGRATION TEST 890f275
       WORKFLOW_SHA: ${{ github.sha }}
     steps:
       - name: Checkout fixed PR1+PR2 integration source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 7a24fbe6ecfedaa8ca4c2e59a70983db0ee2b8e5
+          ref: 890f275a8c0b316965d189b91562bc6eecc5cca7
           persist-credentials: false
           fetch-depth: 1
       - name: Set up fixed test Python
@@ -64,7 +64,7 @@ jobs:
                   super().addError(test, error)
           suite = unittest.defaultTestLoader.loadTestsFromNames(modules)
           result = unittest.TextTestRunner(verbosity=2, resultclass=CompilerDiagnostics).run(suite)
-          assert result.wasSuccessful() and not result.skipped and result.testsRun == 36, 'All integration tests must run and pass'
+          assert result.wasSuccessful() and not result.skipped and result.testsRun == 37, 'All integration tests must run and pass'
           from tests.test_app_update_binary import binary_vectors
           from tests.test_app_update_zip_structure import zip_vectors
           test_evidence = {'tests_run': result.testsRun, 'skipped': len(result.skipped), 'swift_macho_vectors': len(binary_vectors()), 'swift_zip_vectors': len(zip_vectors()), 'swift_paths': 'Unmodified production AppUpdateCore functions compiled and executed'}
@@ -98,7 +98,7 @@ jobs:
           manifest = {
               'test_label': label,
               'source_commit': sha,
-              'integration_sources': {'master': 'b376b8c518cb2e86e2d3f172eb0c5c6944c148eb', 'pr2': 'c007fdce6915467cf9fabe57edcf900a48d6c59f'},
+              'integration_sources': {'master': 'd89b4007051d2096eafeccf4cdd40410f27eb9af', 'pr2': '9199762fdbf9a995c3334e60bb284b2de9fc666e'},
               'regressions': test_evidence,
               'source_version': source_version,
               'workflow_commit': os.environ['WORKFLOW_SHA'],
@@ -121,7 +121,7 @@ jobs:
           assert 'Authority=Developer ID' not in signing_details
           out = p / 'test-artifact'
           out.mkdir()
-          archive = out / f'EasyColab-PR1-PR2-integration-7a24fbe-{arch_label}.zip'
+          archive = out / f'EasyColab-PR1-PR2-integration-890f275-{arch_label}.zip'
           run('ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(app), str(archive))
           extracted = p / 'archive-verification'
           extracted.mkdir()
@@ -148,7 +148,7 @@ jobs:
       - name: Upload integration test package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: EasyColab-PR1-PR2-integration-7a24fbe
+          name: EasyColab-PR1-PR2-integration-890f275
           path: test-artifact/
           if-no-files-found: error
           retention-days: 7
