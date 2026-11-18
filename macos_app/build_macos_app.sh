@@ -7,10 +7,22 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 APP_NAME="EasyColab"
 EXEC_NAME="EasyColab"
 VERSION_FILE="${PROJECT_ROOT}/VERSION"
-if [ -f "${VERSION_FILE}" ]; then
+# CI / tag builds may export APP_VERSION, RELEASE_TAG, and GIT_COMMIT.
+if [ -z "${APP_VERSION:-}" ] && [ -f "${VERSION_FILE}" ]; then
     APP_VERSION="$(tr -d '[:space:]' < "${VERSION_FILE}")"
 fi
 APP_VERSION="${APP_VERSION:-1.1.0}"
+if [ -z "${GIT_COMMIT:-}" ] && command -v git >/dev/null 2>&1; then
+    if git -C "${PROJECT_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        GIT_COMMIT="$(git -C "${PROJECT_ROOT}" rev-parse HEAD 2>/dev/null || true)"
+    fi
+fi
+GIT_COMMIT="${GIT_COMMIT:-}"
+if [ -z "${RELEASE_TAG:-}" ] && command -v git >/dev/null 2>&1; then
+    RELEASE_TAG="$(git -C "${PROJECT_ROOT}" describe --tags --exact-match 2>/dev/null || true)"
+fi
+RELEASE_TAG="${RELEASE_TAG:-}"
+BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 BUNDLE_DIR="${PROJECT_ROOT}/${APP_NAME}.app"
 CONTENTS_DIR="${BUNDLE_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
@@ -24,6 +36,25 @@ for res_file in "VERSION" "app.py" "runtime_auth.py" "colab_bridge.py" "EasyCola
         cp -f "${PROJECT_ROOT}/${res_file}" "${RESOURCES_DIR}/${res_file}"
     fi
 done
+
+export APP_VERSION RELEASE_TAG GIT_COMMIT BUILT_AT
+python3 - "${RESOURCES_DIR}/EasyColabBuildInfo.json" <<'PY'
+import json, os, sys
+out = sys.argv[1]
+doc = {
+    "schema": 1,
+    "version": os.environ.get("APP_VERSION", ""),
+    "release_tag": os.environ.get("RELEASE_TAG", ""),
+    "git_commit": os.environ.get("GIT_COMMIT", ""),
+    "built_at": os.environ.get("BUILT_AT", ""),
+    "bundle_id": "app.easycolab.studio.macos",
+    "min_os": "13.0",
+    "repository": "zdxrockets/easycolab",
+}
+with open(out, "w", encoding="utf-8") as fh:
+    json.dump(doc, fh, indent=2)
+    fh.write("\n")
+PY
 
 # 1. 生成 Info.plist
 cat > "${CONTENTS_DIR}/Info.plist" <<EOF
@@ -51,6 +82,10 @@ cat > "${CONTENTS_DIR}/Info.plist" <<EOF
     <string>${APP_VERSION}</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <key>EasyColabGitCommit</key>
+    <string>${GIT_COMMIT}</string>
+    <key>EasyColabReleaseTag</key>
+    <string>${RELEASE_TAG}</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSAppTransportSecurity</key>
@@ -137,6 +172,7 @@ swiftc -O \
     -framework AppKit \
     -framework AVKit \
     -framework UniformTypeIdentifiers \
+    -framework CryptoKit \
     "${SCRIPT_DIR}/EasyColabStudio.swift" \
     "${SCRIPT_DIR}"/Sources/*.swift \
     -o "${MACOS_DIR}/${EXEC_NAME}_arm64"
@@ -148,6 +184,7 @@ if swiftc -O \
     -framework AppKit \
     -framework AVKit \
     -framework UniformTypeIdentifiers \
+    -framework CryptoKit \
     "${SCRIPT_DIR}/EasyColabStudio.swift" \
     "${SCRIPT_DIR}"/Sources/*.swift \
     -o "${MACOS_DIR}/${EXEC_NAME}_x86_64" 2>/dev/null; then

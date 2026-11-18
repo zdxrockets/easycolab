@@ -72,11 +72,19 @@ struct EasyColabApp: App {
                 }
                 .keyboardShortcut("l", modifiers: [.command, .shift])
             }
+            CommandGroup(after: .appInfo) {
+                Button(L("检查更新…", "Check for Updates…")) {
+                    NotificationCenter.default.post(name: .openEasyColabUpdater, object: nil)
+                }
+            }
             CommandGroup(replacing: .help) {
                 Button(L("EasyColab 新手引导与使用指南", "EasyColab Quick Start & User Guide")) {
                     NotificationCenter.default.post(name: .openEasyColabGuide, object: nil)
                 }
                 .keyboardShortcut("/", modifiers: [.command, .shift])
+                Button(L("检查更新…", "Check for Updates…")) {
+                    NotificationCenter.default.post(name: .openEasyColabUpdater, object: nil)
+                }
             }
         }
     }
