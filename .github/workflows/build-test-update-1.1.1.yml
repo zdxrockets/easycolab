@@ -9,9 +9,10 @@ permissions:
 jobs:
   build-test-update:
     if: github.repository == 'zdxrockets/easycolab' && github.ref == 'refs/heads/master'
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 25
     env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
       SOURCE_SHA: 890f275a8c0b316965d189b91562bc6eecc5cca7
       APP_PY_SHA256: 817957d0b0cecbf4a666eaf99fedfa7bb14954f5aecf1408ed6ba2726b612a0d
       TEST_LABEL: EasyColab TEST UPDATE 1.1.1 (PR1+PR2 890f275)
@@ -52,7 +53,11 @@ jobs:
           run('bash', '-n', 'macos_app/build_macos_app.sh')
           import unittest
           assert shutil.which('swiftc'), 'Real Swift compiler is required; skips are not accepted'
-          run('swiftc', '--version')
+          compiler_path = run('xcrun', '--find', 'swiftc', capture=True).stdout.strip()
+          compiler_version = run('swiftc', '--version', capture=True).stdout.strip()
+          sdk_version = run('xcrun', '--sdk', 'macosx', '--show-sdk-version', capture=True).stdout.strip()
+          print(compiler_path, compiler_version, 'macOS SDK', sdk_version, flush=True)
+          assert compiler_path.startswith(os.environ['DEVELOPER_DIR'] + '/') and 'Apple Swift version 6.1.2' in compiler_version and sdk_version == '15.5', 'Unexpected Xcode/Swift/SDK environment'
           modules = ['tests.test_h3_image_offload_plan', 'tests.test_app_update_manifest', 'tests.test_app_update_packaging', 'tests.test_app_update_binary', 'tests.test_app_update_zip_structure', 'tests.test_app_update_arch_manifest']
           class CompilerDiagnostics(unittest.TextTestResult):
               def addError(self, test, error):
